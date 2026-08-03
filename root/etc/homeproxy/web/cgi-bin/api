@@ -89,7 +89,7 @@ set_main_node)
 		nil|urltest) : ;;
 		"") json_err "missing node" ;;
 		*)
-			[ "$(uci -q get $CONF.$body.type 2>/dev/null)" = "node" ] || json_err "no such node: $body"
+			sec_type=$(uci -q show "$CONF.$body" 2>/dev/null | awk -F= 'NR==1{print $2}'); [ "$sec_type" = "node" ] || json_err "no such node: $body"
 			;;
 	esac
 	uci set $CONF.config.main_node="$body" 2>/dev/null || json_err "uci set failed"
