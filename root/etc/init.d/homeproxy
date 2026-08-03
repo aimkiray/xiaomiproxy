@@ -152,6 +152,7 @@ start_service() {
 
     # firewall (iptables+ipset)
     sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"
+    : > "$RUN_DIR/firewall.active"
 
     log "HomeProxy started (sing-box: $("$PROG" version -n 2>/dev/null | head -1))."
 }
@@ -161,6 +162,7 @@ stop_service() {
     /etc/init.d/cron restart >/dev/null 2>&1
 
     sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
+    rm -f "$RUN_DIR/firewall.active"
 
     local table_mark
     config_load "$CONF"

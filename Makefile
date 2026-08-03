@@ -31,8 +31,15 @@ define Package/homeproxy
 	+kmod-ipt-tproxy \
 	+iptables-mod-ipset \
 	+kmod-ipt-ipset \
-	+ipset
-	+curl
+	+iptables-mod-conntrack \
+	+kmod-ipt-conntrack \
+	+iptables-mod-multiport \
+	+kmod-ipt-multiport \
+	+iptables-mod-extra \
+	+kmod-ipt-extra \
+	+ipset \
+	+curl \
+	+firewall
 endef
 
 define Package/homeproxy/description

@@ -28,6 +28,7 @@ tproxy_mark=$(uci_get "infra.tproxy_mark");     tproxy_mark=${tproxy_mark:-101}
 common_port=$(uci_get "infra.common_port");     common_port=${common_port:-22,53,80,143,443,465,587,853,873,993,995,5222,8080,8443,9418}
 
 lan_proxy_mode=$(uci_get "control.lan_proxy_mode"); lan_proxy_mode=${lan_proxy_mode:-disabled}
+dns_redirect=$(uci_get "infra.dns_redirect"); dns_redirect=${dns_redirect:-1}
 
 # LAN interface + subnet
 lan_if=$(uci -q get network.lan.device 2>/dev/null); [ -z "$lan_if" ] && lan_if=$(uci -q get network.lan.ifname 2>/dev/null)
@@ -107,6 +108,11 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
     cn_cnt=$(ipset list homeproxy_cn4 2>/dev/null | awk '/Number of entries/{print $4}')
     [ -z "$cn_cnt" ] && cn_cnt=0
     [ "$cn_cnt" -le 0 ] && echo "homeproxy: WARNING: CN ipset empty/missing ($RES_DIR/china_ip4.txt) -- $routing_mode will proxy all traffic." >&2
+    if [ "$ipv6" = "1" ]; then
+        cn6_cnt=$(ipset list homeproxy_cn6 2>/dev/null | awk '/Number of entries/{print $4}')
+        [ -z "$cn6_cnt" ] && cn6_cnt=0
+        [ "$cn6_cnt" -le 0 ] && echo "homeproxy: WARNING: CN ipset empty/missing ($RES_DIR/china_ip6.txt) -- v6 $routing_mode will proxy all traffic." >&2
+    fi
 fi
 
 cnset4=homeproxy_cn4
@@ -180,7 +186,12 @@ apply_tcp() {
     $ip -t nat -A PREROUTING $IFARG -p tcp -j homeproxy_redir
     emit_skip "$ip" nat homeproxy_redir
     emit_routing "$ip" nat homeproxy_redir "$cnset"
-    emit_control "$ip" nat homeproxy_redir "-p tcp -j REDIRECT --to-ports $redirect_port"
+    # mirror upstream: only redirect common ports when routing_port=common.
+    local tcp_act="-p tcp -j REDIRECT --to-ports $redirect_port"
+    if [ "$routing_port" = "common" ]; then
+        tcp_act="-p tcp -m multiport --dports $common_port -j REDIRECT --to-ports $redirect_port"
+    fi
+    emit_control "$ip" nat homeproxy_redir "$tcp_act"
 }
 
 # --- UDP tproxy (mangle) --------------------------------------------------
@@ -231,8 +242,17 @@ if echo "$proxy_mode" | grep -q tproxy && [ "$udp_tproxy" = "1" ]; then
     apply_udp "$IP4" "$cnset4"
     if [ "$ipv6" = "1" ]; then apply_udp "$IP6" "$cnset6"; fi
 fi
-apply_dns "$IP4"
-[ "$ipv6" = "1" ] && apply_dns "$IP6"
+# DNS hijack (UDP/53 only, mirroring upstream). Skipped when the user disables
+# it (infra.dns_redirect=0) or dnsmasq already redirects DNS, to avoid double
+# hijack.
+dns_hijacked=0
+[ "$(uci -q get dhcp.@dnsmasq[0].dns_redirect 2>/dev/null)" = "1" ] && dns_hijacked=1
+if [ "$dns_redirect" = "1" ] && [ "$dns_hijacked" != "1" ]; then
+    apply_dns "$IP4"
+    [ "$ipv6" = "1" ] && apply_dns "$IP6"
+else
+    echo "homeproxy: DNS hijack skipped (dns_redirect=$dns_redirect dnsmasq_hijacked=$dns_hijacked)." >&2
+fi
 
 echo "homeproxy: firewall rules applied (mode=$proxy_mode routing=$routing_mode lan=$lan_proxy_mode)." >&2
 exit 0
