@@ -28,9 +28,10 @@ json_ok()  { hdr 'Content-Type: application/json'; printf '%s\n' "$1"; }
 json_err() { hdr 'Content-Type: application/json'; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
 text_out() { hdr 'Content-Type: text/plain; charset=utf-8'; printf '%s' "$1"; }
 
-# escape a string for a JSON double-quoted value
+# escape a string for a JSON double-quoted value (newlines -> \n)
 jesc() {
-	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\r\n'
+	printf '%s' "$1" | tr -d '\r' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
+		| awk '{printf "%s%s",sep,$0; sep="\\n"} END{print ""}'
 }
 
 # parse ?action=...&lines=...
