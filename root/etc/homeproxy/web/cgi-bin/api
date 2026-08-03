@@ -9,6 +9,7 @@
 #   config             raw ubus uci get JSON (full homeproxy config)
 #   set_main_node      body=node        -> set + restart
 #   set_routing_mode   body=mode        -> set + restart
+#   set_lan_proxy     body=mode        -> set control.lan_proxy_mode + restart
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
@@ -108,6 +109,19 @@ set_routing_mode)
 	json_ok '{"ok":true,"routing_mode":"'"$(jesc "$body")"'"}'
 	;;
 
+set_lan_proxy)
+	body=$(read_body | tr -d '\r\n')
+	body=${body#mode=}
+	case "$body" in
+		disabled|only_proxy|listed_only|except_listed) : ;;
+		*) json_err "bad lan_proxy_mode: $body" ;;
+	esac
+	uci set $CONF.control.lan_proxy_mode="$body" 2>/dev/null || json_err "uci set failed"
+	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	do_restart
+	json_ok '{"ok":true,"lan_proxy_mode":"'"$(jesc "$body")"'"}'
+	;;
+
 subscribe)
 	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
 	if lua /data/other_vol/homeproxy/lib/update_subscriptions.lua >"$tmp" 2>&1; then
@@ -135,7 +149,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy subscribe restart log"
 	;;
 
 *)

@@ -67,6 +67,19 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
  </div>
 
  <div class="card">
+  <h2>LAN proxy</h2>
+  <div class="row">
+   <select id="lanproxy">
+    <option value="disabled">disabled (off)</option>
+    <option value="only_proxy">only_proxy (global)</option>
+    <option value="listed_only">listed_only</option>
+    <option value="except_listed">except_listed</option>
+   </select>
+   <button id="applyLanProxy" class="ghost">Apply</button>
+  </div>
+ </div>
+
+ <div class="card">
   <h2>Actions</h2>
   <div class="opts">
    <button id="btnSub" class="ghost">Update subscription</button>
@@ -106,6 +119,7 @@ async function loadState(){
   const kv={main_node:s.main_node,routing_mode:s.routing_mode,proxy_mode:s.proxy_mode,lan_proxy_mode:s.lan_proxy_mode};
   $('kv').innerHTML=fmtKV(kv);
   $('mode').value=s.routing_mode;
+  $('lanproxy').value=s.lan_proxy_mode;
   if(cfg&&cfg.values){
    const sel=$('node');const cur=s.main_node;
    const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
@@ -129,6 +143,10 @@ async function applyMode(){
  const v=$('mode').value;setBusy('applyMode',true);
  try{const r=await apiJson('set_routing_mode',{method:'POST',body:v});toast(r.ok?'Routing mode set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyMode',false)}
 }
+async function applyLanProxy(){
+ const v=$('lanproxy').value;setBusy('applyLanProxy',true);
+ try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
+}
 async function doSubscribe(){
  setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
  try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
@@ -149,6 +167,7 @@ async function refresh(){await loadConfig();await loadLog()}
 
 $('applyNode').onclick=applyNode;
 $('applyMode').onclick=applyMode;
+$('applyLanProxy').onclick=applyLanProxy;
 $('btnSub').onclick=doSubscribe;
 $('btnRestart').onclick=doRestart;
 $('btnRefresh').onclick=refresh;
