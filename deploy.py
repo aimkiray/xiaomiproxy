@@ -23,6 +23,7 @@ No pip packages needed -- pure stdlib + subprocess.
 """
 
 import argparse
+import atexit
 import os
 import shutil
 import subprocess
@@ -163,11 +164,19 @@ class Router:
         rc, out, _ = self.run("echo OK", timeout=10)
         return rc == 0 and "OK" in out
 
+    def cleanup(self):
+        """Remove the on-disk askpass helper (it contains the password)."""
+        try:
+            if self._askpass and os.path.exists(self._askpass):
+                os.unlink(self._askpass)
+        except OSError:
+            pass
+
 # ─── helpers ────────────────────────────────────────────────────────────────
 def patch_text(text, patches):
     for old, new in patches:
         if old not in text:
-            print(f"  WARN: patch target not found: {old[:60]!r}")
+            raise RuntimeError(f"patch target not found: {old[:80]!r}")
         text = text.replace(old, new)
     return text
 
@@ -232,8 +241,8 @@ def probe(rt: Router):
     return results
 
 # ─── backup ─────────────────────────────────────────────────────────────────
-BACKUP_TAR  = "/tmp/hp_deploy_backup.tar.gz"
-BACKUP_META = "/tmp/hp_deploy_meta.sh"
+BACKUP_TAR  = "/data/other_vol/.hp_deploy_backup.tar.gz"
+BACKUP_META = "/data/other_vol/.hp_deploy_meta.sh"
 CONFIRM_FILE = "/tmp/hp_deploy_confirmed"
 
 def backup(rt: Router):
@@ -358,7 +367,7 @@ sleep 1
 
 # ── remove new deploy ──
 rm -rf {HP_BASE}
-rm -f /etc/homeproxy              # symlink or real dir
+rm -rf /etc/homeproxy             # symlink or real dir
 rm -f /etc/init.d/homeproxy
 rm -f /etc/profile.d/homeproxy.sh
 
@@ -399,7 +408,7 @@ else
 fi
 
 # cleanup
-rm -f "$CONFIRM" "$META" "$BACKUP" {WATCHDOG} /tmp/hp_watchdog.pid
+rm -f "$CONFIRM" "$META" "$BACKUP" /tmp/hp_watchdog.pid
 """
 
 def launch_watchdog(rt: Router, timeout):
@@ -415,7 +424,7 @@ def launch_watchdog(rt: Router, timeout):
         print("  ⚠ watchdog may not have started")
 
 # ─── apply deployment ───────────────────────────────────────────────────────
-def apply_deploy(rt: Router, force_config=False):
+def apply_deploy(rt: Router, force_config=False, post_apply=None):
     print("\n[5/8] Applying deployment (stop → swap → start)...")
 
     # stop old service
@@ -467,6 +476,27 @@ uci -q commit firewall""")
     if status != "running":
         print("  ⚠ sing-box not running! Check with: ssh root@host 'cat /var/run/homeproxy/homeproxy.log'")
         print("  ⚠ The watchdog will auto-rollback if you do not confirm.")
+
+    # post-apply: run a user config script (e.g. set subscription, pick a node,
+    # enable LAN proxy). Runs BEFORE the confirm window so the rollback
+    # watchdog covers it -- /etc/config/homeproxy is part of the backup tar, so
+    # a rollback restores the pre-deploy config (no new subscription/node).
+    if post_apply:
+        print("  → running post-apply script...")
+        if not os.path.isfile(post_apply):
+            print(f"  ✗ post-apply script not found: {post_apply}")
+            raise RuntimeError(f"missing post-apply script: {post_apply}")
+        rt.upload(post_apply, "/tmp/hp_post_apply.sh")
+        rt.run("chmod 755 /tmp/hp_post_apply.sh")
+        env_prefix = f'export PATH="$PATH:{SINGBOX.rsplit("/",1)[0]}:{BIN}"; '
+        rc, out, err = rt.run(f"{env_prefix}sh /tmp/hp_post_apply.sh", timeout=120)
+        if out:
+            print(out.rstrip())
+        if rc != 0:
+            print(f"  ⚠ post-apply returned rc={rc}")
+            if err:
+                print(f"    stderr: {err}")
+        rt.run("rm -f /tmp/hp_post_apply.sh")
     return status
 
 # ─── confirm / rollback ─────────────────────────────────────────────────────
@@ -500,7 +530,8 @@ def confirm_deploy(rt: Router, timeout):
         print("\n  → Manual rollback requested.")
         print("  → Not sending confirm — watchdog will restore backup...")
         # optionally trigger immediate rollback
-        rc, _, _ = rt.run(f"kill $(cat /tmp/hp_watchdog.pid 2>/dev/null) 2>/dev/null; sh {WATCHDOG} now", timeout=30)
+        rt.run("kill -9 $(cat /tmp/hp_watchdog.pid 2>/dev/null) 2>/dev/null; sleep 1", timeout=10)
+        rt.run(f"sh {WATCHDOG} now", timeout=60)
         return False
 
     else:  # timeout
@@ -535,8 +566,14 @@ def manual_rollback(rt: Router):
         print("  ✗ No backup found — nothing to rollback.")
         return False
     print("  → Triggering watchdog rollback...")
-    rt.run("kill $(cat /tmp/hp_watchdog.pid 2>/dev/null) 2>/dev/null")
-    rt.run_ok(f"sh {WATCHDOG} now", timeout=30)
+    # /tmp is ramfs: the watchdog script may be gone after a reboot, so
+    # re-upload it from the host before invoking. This enables power-loss
+    # recovery because BACKUP_TAR / BACKUP_META live on persistent /data/other_vol.
+    rc, wd, _ = rt.run(f"test -f {WATCHDOG} && echo yes || echo no")
+    if "yes" not in wd:
+        rt.upload_text(make_watchdog(0), WATCHDOG, "755")
+    rt.run("kill -9 $(cat /tmp/hp_watchdog.pid 2>/dev/null) 2>/dev/null; sleep 1", timeout=10)
+    rt.run(f"sh {WATCHDOG} now", timeout=60)
     print("  ✓ Rollback executed.")
     return True
 
@@ -553,11 +590,17 @@ def main():
                     help="overwrite existing UCI config too")
     ap.add_argument("--dry-run", action="store_true",
                     help="probe + show plan, do not deploy")
+    ap.add_argument("--post-apply", metavar="FILE",
+                    help="local shell script to run on the router after the service "
+                         "starts (e.g. set subscription + node + enable LAN proxy). "
+                         "Runs BEFORE the confirm window, so the rollback watchdog "
+                         "(which restores /etc/config/homeproxy from backup) covers it.")
     ap.add_argument("--rollback", action="store_true",
                     help="manually rollback the last deploy")
     args = ap.parse_args()
 
     rt = Router(args.host, args.user, args.password)
+    atexit.register(rt.cleanup)
 
     # connectivity
     print(f"[0/8] Connecting to {args.user}@{args.host} ...")
@@ -596,11 +639,15 @@ def main():
 
     # 5. apply
     try:
-        status = apply_deploy(rt, force_config=args.force)
+        status = apply_deploy(rt, force_config=args.force, post_apply=args.post_apply)
     except Exception as e:
         print(f"\n  ✗ Deploy failed: {e}")
         print("  → Triggering immediate rollback...")
-        rt.run(f"sh {WATCHDOG} now 2>/dev/null; true")
+        # Kill the sleeping watchdog first so the `now` instance is the only
+        # rollback in flight (otherwise both would race and the second would
+        # wipe the just-restored tree after the first deleted the backup).
+        rt.run("kill -9 $(cat /tmp/hp_watchdog.pid 2>/dev/null) 2>/dev/null; sleep 1", timeout=10)
+        rt.run(f"sh {WATCHDOG} now 2>/dev/null; true", timeout=60)
         verify_rollback(rt)
         return 1
 
