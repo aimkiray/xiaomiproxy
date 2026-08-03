@@ -1,0 +1,143 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# HomeProxy web UI backend (CGI). Served by a standalone uhttpd instance
+# (init.d/homeproxy-web) bound to the LAN interface -- no authentication.
+#
+# Endpoints (action= in the query string; value in the POST body for writes):
+#   state              current settings + running flag + sing-box version
+#   config             raw ubus uci get JSON (full homeproxy config)
+#   set_main_node      body=node        -> set + restart
+#   set_routing_mode   body=mode        -> set + restart
+#   subscribe          -> update subscriptions + restart
+#   restart            -> /etc/init.d/homeproxy restart
+#   log                -> last N lines of the log (lines=, default 80)
+
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/data/other_vol/bin:/data/other_vol/homeproxy/bin
+CONF=homeproxy
+RUN_DIR=/var/run/homeproxy
+LOG_PATH=$RUN_DIR/$CONF.log
+INIT=/etc/init.d/$CONF
+SINGBOX="${HP_SINGBOX:-$(command -v sing-box 2>/dev/null)}"
+[ -n "$SINGBOX" ] || SINGBOX=/data/other_vol/bin/sing-box
+
+# --- helpers ---------------------------------------------------------------
+hdr() { printf '%s\r\n\r\n' "$1"; }
+json_ok()  { hdr 'Content-Type: application/json'; printf '%s\n' "$1"; }
+json_err() { hdr 'Content-Type: application/json'; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
+text_out() { hdr 'Content-Type: text/plain; charset=utf-8'; printf '%s' "$1"; }
+
+# escape a string for a JSON double-quoted value
+jesc() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\r\n'
+}
+
+# parse ?action=...&lines=...
+Q_action=""; Q_lines="80"
+for kv in $(printf '%s' "${QUERY_STRING:-}" | tr '&' ' '); do
+	case "$kv" in
+		action=*) Q_action=${kv#action=} ;;
+		lines=*)  Q_lines=${kv#lines=} ;;
+	esac
+done
+case "$Q_lines" in *[!0-9]*) Q_lines=80 ;; esac
+
+read_body() {
+	local n="${CONTENT_LENGTH:-0}"
+	case "$n" in *[!0-9]*) n=0 ;; esac
+	[ "$n" -gt 0 ] 2>/dev/null && dd bs=1 count="$n" 2>/dev/null || true
+}
+
+valid_mode() {
+	case "$1" in
+		bypass_mainland_china|global|gfwlist|proxy_mainland_china|custom) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# restart the PROXY only (the web UI init is separate, so this never kills uhttpd)
+do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1; }
+
+# --- endpoints -------------------------------------------------------------
+case "$Q_action" in
+
+state)
+	running=false
+	pgrep -f "sing-box run --config $RUN_DIR/sing-box" >/dev/null 2>&1 && running=true
+	version=$("$SINGBOX" version -n 2>/dev/null | awk 'NR==1{print $NF}')
+	[ -z "$version" ] && version="unknown"
+	main_node=$(uci -q get $CONF.config.main_node 2>/dev/null); main_node=${main_node:-nil}
+	routing_mode=$(uci -q get $CONF.config.routing_mode 2>/dev/null); routing_mode=${routing_mode:-bypass_mainland_china}
+	proxy_mode=$(uci -q get $CONF.config.proxy_mode 2>/dev/null); proxy_mode=${proxy_mode:-redirect_tproxy}
+	lan_proxy=$(uci -q get $CONF.control.lan_proxy_mode 2>/dev/null); lan_proxy=${lan_proxy:-disabled}
+	json_ok "$(printf '{"ok":true,"running":%s,"version":"%s","main_node":"%s","routing_mode":"%s","proxy_mode":"%s","lan_proxy_mode":"%s"}' \
+		"$running" "$(jesc "$version")" "$(jesc "$main_node")" "$(jesc "$routing_mode")" "$(jesc "$proxy_mode")" "$(jesc "$lan_proxy")")"
+	;;
+
+config)
+	out=$(ubus call uci get "{\"config\":\"$CONF\"}" 2>/dev/null)
+	[ -n "$out" ] || json_err "ubus uci get failed"
+	hdr 'Content-Type: application/json'; printf '%s\n' "$out"
+	;;
+
+set_main_node)
+	body=$(read_body | tr -d '\r\n')
+	body=${body#node=}
+	case "$body" in
+		nil|urltest) : ;;
+		"") json_err "missing node" ;;
+		*)
+			[ "$(uci -q get $CONF.$body.type 2>/dev/null)" = "node" ] || json_err "no such node: $body"
+			;;
+	esac
+	uci set $CONF.config.main_node="$body" 2>/dev/null || json_err "uci set failed"
+	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	do_restart
+	json_ok '{"ok":true,"main_node":"'"$(jesc "$body")"'"}'
+	;;
+
+set_routing_mode)
+	body=$(read_body | tr -d '\r\n')
+	body=${body#mode=}
+	valid_mode "$body" || json_err "bad routing_mode: $body"
+	uci set $CONF.config.routing_mode="$body" 2>/dev/null || json_err "uci set failed"
+	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	do_restart
+	json_ok '{"ok":true,"routing_mode":"'"$(jesc "$body")"'"}'
+	;;
+
+subscribe)
+	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
+	if lua /data/other_vol/homeproxy/lib/update_subscriptions.lua >"$tmp" 2>&1; then
+		uci commit $CONF 2>/dev/null
+		do_restart
+		tail -n 20 "$tmp" 2>/dev/null > "$tmp.short"
+		hdr 'Content-Type: application/json'
+		printf '{"ok":true,"output":"%s"}\n' "$(jesc "$(cat "$tmp.short" 2>/dev/null)")"
+	else
+		rc=$?
+		hdr 'Content-Type: application/json'
+		printf '{"ok":false,"error":"subscription update failed (rc=%s)","output":"%s"}\n' "$rc" "$(jesc "$(tail -n 20 "$tmp" 2>/dev/null)")"
+	fi
+	rm -f "$tmp" "$tmp.short" 2>/dev/null
+	;;
+
+restart)
+	do_restart
+	json_ok '{"ok":true,"restarted":true}'
+	;;
+
+log)
+	n="$Q_lines"
+	text_out "$(tail -n "$n" "$LOG_PATH" 2>/dev/null || echo '(no log yet)')"
+	;;
+
+""|help)
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode subscribe restart log"
+	;;
+
+*)
+	json_err "unknown action: $Q_action"
+	;;
+esac

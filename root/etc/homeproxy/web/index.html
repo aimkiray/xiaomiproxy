@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HomeProxy</title>
+<style>
+:root{--bg:#16181d;--card:#1e2128;--card2:#262a33;--tx:#d7dde5;--mut:#8b94a3;--ac:#4a9eff;--ok:#3fb950;--bad:#f85149;--bd:#33383f;--r:10px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:18px 16px 60px}
+h1{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+.badge{font-size:12px;padding:2px 9px;border-radius:20px;font-weight:600}
+.b-on{background:rgba(63,185,80,.16);color:var(--ok)} .b-off{background:rgba(248,81,73,.15);color:var(--bad)} .b-warn{background:rgba(74,158,255,.15);color:var(--ac)}
+.sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:var(--r);padding:16px;margin-bottom:14px}
+.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 12px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.row+.row{margin-top:10px}
+label{color:var(--mut);min-width:96px;font-size:13px}
+select,input{flex:1;background:var(--card2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:8px 10px;font-size:14px;min-width:0}
+select:focus,input:focus{outline:none;border-color:var(--ac)}
+button{background:var(--ac);color:#fff;border:0;border-radius:7px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:var(--card2);color:var(--tx);border:1px solid var(--bd)}
+button.danger{background:var(--bad)}
+.kv{display:flex;gap:8px;font-size:13px;padding:4px 0;border-bottom:1px solid var(--bd)}
+.kv:last-child{border:0} .kv span:first-child{color:var(--mut);min-width:130px}
+.kv span:last-child{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px;margin:0;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-all;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#aab2bd}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--card2);border:1px solid var(--bd);padding:10px 18px;border-radius:8px;font-size:13px;box-shadow:0 8px 28px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--mut);border-top-color:var(--ac);border-radius:50%;animation:s .8s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+.opts{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+ <h1>HomeProxy <span id="badge" class="badge b-off">…</span></h1>
+ <div class="sub" id="ver">loading…</div>
+
+ <div class="card">
+  <h2>Status</h2>
+  <div id="kv"></div>
+ </div>
+
+ <div class="card">
+  <h2>Main node</h2>
+  <div class="row">
+   <select id="node"></select>
+   <button id="applyNode" class="ghost">Apply</button>
+  </div>
+ </div>
+
+ <div class="card">
+  <h2>Routing mode</h2>
+  <div class="row">
+   <select id="mode">
+    <option value="bypass_mainland_china">bypass_mainland_china</option>
+    <option value="global">global</option>
+    <option value="gfwlist">gfwlist</option>
+    <option value="proxy_mainland_china">proxy_mainland_china</option>
+    <option value="custom">custom</option>
+   </select>
+   <button id="applyMode" class="ghost">Apply</button>
+  </div>
+ </div>
+
+ <div class="card">
+  <h2>Actions</h2>
+  <div class="opts">
+   <button id="btnSub" class="ghost">Update subscription</button>
+   <button id="btnRestart" class="danger">Restart proxy</button>
+   <button id="btnRefresh" class="ghost">Refresh</button>
+  </div>
+  <pre id="actOut" style="display:none;margin-top:12px"></pre>
+ </div>
+
+ <div class="card">
+  <h2>Log <span id="logSpin" style="display:none" class="spin"></span></h2>
+  <div class="opts" style="margin-bottom:10px">
+   <button id="btnLog" class="ghost">Refresh log</button>
+   <button id="btnTail" class="ghost">Auto-tail: off</button>
+  </div>
+  <pre id="log">…</pre>
+ </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API='/cgi-bin/api';
+const $=id=>document.getElementById(id);
+let cfg=null,tailTimer=null,busy={};
+
+function toast(msg,ms=2600){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms)}
+async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});return r.text()}
+async function apiJson(action,opts={}){const t=await api(action,opts);try{return JSON.parse(t)}catch(e){throw new Error('bad json: '+t.slice(0,120))}}
+
+function fmtKV(o){return Object.entries(o).map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')}
+
+async function loadState(){
+ try{
+  const s=await apiJson('state');
+  const b=$('badge');b.className='badge '+(s.running?'b-on':'b-off');b.textContent=s.running?'running':'stopped';
+  $('ver').textContent='sing-box '+s.version+' · MiWiFi Lua port';
+  const kv={main_node:s.main_node,routing_mode:s.routing_mode,proxy_mode:s.proxy_mode,lan_proxy_mode:s.lan_proxy_mode};
+  $('kv').innerHTML=fmtKV(kv);
+  $('mode').value=s.routing_mode;
+  if(cfg&&cfg.values){
+   const sel=$('node');const cur=s.main_node;
+   const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
+   sel.innerHTML='<option value="nil">— none (nil) —</option>'+nodes.map(([k,v])=>`<option value="${k}"${k===cur?' selected':''}>${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
+   if(cur==='urltest')sel.innerHTML='<option value="urltest" selected>urltest (auto)</option>'+sel.innerHTML;
+   else if(!nodes.some(([k])=>k===cur)&&cur!=='nil')sel.value=cur;
+  }
+ }catch(e){toast('state: '+e.message)}
+}
+async function loadConfig(){try{const t=await api('config');cfg=JSON.parse(t);loadState()}catch(e){toast('config: '+e.message)}}
+
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+function setBusy(id,on){busy[id]=on;const btn=$(id);if(btn){btn.disabled=on;const o=btn.innerHTML;if(on&&o.indexOf('spin')<0)btn.dataset.h=o,btn.innerHTML='<span class="spin"></span>';else if(!on&&btn.dataset.h)btn.innerHTML=btn.dataset.h}}
+
+async function applyNode(){
+ const v=$('node').value;setBusy('applyNode',true);
+ try{const r=await apiJson('set_main_node',{method:'POST',body:v});toast(r.ok?'Main node set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyNode',false)}
+}
+async function applyMode(){
+ const v=$('mode').value;setBusy('applyMode',true);
+ try{const r=await apiJson('set_routing_mode',{method:'POST',body:v});toast(r.ok?'Routing mode set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyMode',false)}
+}
+async function doSubscribe(){
+ setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
+ try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
+}
+async function doRestart(){
+ setBusy('btnRestart',true);toast('restarting…');
+ try{await apiJson('restart',{method:'POST'});toast('proxy restarted');setTimeout(refresh,1500)}catch(e){toast('restart failed: '+e.message)}finally{setBusy('btnRestart',false)}
+}
+async function loadLog(){
+ const t=await api('log',{q:'lines=120'});$('log').textContent=t||'(empty)'
+}
+function toggleTail(){
+ if(tailTimer){clearInterval(tailTimer);tailTimer=null;$('btnTail').textContent='Auto-tail: off';$('btnTail').classList.add('ghost')}
+ else{tailTimer=setInterval(loadLog,4000);$('btnTail').textContent='Auto-tail: on';loadLog()}
+}
+
+async function refresh(){await loadConfig();await loadLog()}
+
+$('applyNode').onclick=applyNode;
+$('applyMode').onclick=applyMode;
+$('btnSub').onclick=doSubscribe;
+$('btnRestart').onclick=doRestart;
+$('btnRefresh').onclick=refresh;
+$('btnLog').onclick=loadLog;
+$('btnTail').onclick=toggleTail;
+
+refresh();
+setInterval(loadState,5000);
+</script>
+</body>
+</html>

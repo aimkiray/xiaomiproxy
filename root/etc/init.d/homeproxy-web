@@ -1,0 +1,55 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# HomeProxy web UI (standalone uhttpd, LuCI-less routers).
+# Bound to the LAN interface only -- NO authentication. Provides a minimal
+# control page at http://<lan-ip>:8910/ and a JSON CGI at /cgi-bin/api.
+# Deliberately separate from the main homeproxy init so proxy restarts never
+# kill this web server (the CGI itself triggers /etc/init.d/homeproxy restart).
+
+USE_PROCD=1
+
+START=98
+STOP=12
+
+CONF="homeproxy"
+HP_DIR="/etc/homeproxy"
+WEB_DIR="$HP_DIR/web"
+PORT="${HP_WEBUI_PORT:-8910}"
+
+LOG_PATH="/var/run/homeproxy/homeproxy.log"
+mkdir -p /var/run/homeproxy 2>/dev/null
+log() { echo "$(date "+%H:%M:%S") [hp-web] $*" >> "$LOG_PATH" 2>/dev/null; }
+
+lan_ip() {
+	local ip
+	ip=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{split($2,a,"/");print a[1];exit}')
+	[ -z "$ip" ] && ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -z "$ip" ] && ip=192.168.31.1
+	echo "$ip"
+}
+
+start_service() {
+	[ -d "$WEB_DIR" ] || { log "web dir missing: $WEB_DIR -- not starting."; return 1; }
+	[ -x "$WEB_DIR/cgi-bin/api" ] || log "warning: $WEB_DIR/cgi-bin/api not executable."
+	local addr
+	addr=$(lan_ip)
+
+	procd_open_instance "hp-web"
+	procd_set_param command /usr/sbin/uhttpd
+	procd_append_param command -f -p "$addr:$PORT" -h "$WEB_DIR" -x /cgi-bin -I index.html -t 120 -T 30
+	procd_set_param respawn
+	procd_set_param stderr 1
+	procd_close_instance
+
+	log "web UI listening on http://$addr:$PORT (no auth, LAN only)."
+}
+
+stop_service() {
+	:
+}
+
+reload_service() {
+	stop
+	start
+}

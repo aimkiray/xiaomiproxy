@@ -50,6 +50,7 @@ LIB = f"{HP_BASE}/lib"
 RES = f"{HP_BASE}/resources"
 SCR = f"{HP_BASE}/scripts"
 BIN = f"{HP_BASE}/bin"
+WEB = f"{HP_BASE}/web"
 
 MANIFEST = [
     # ── Lua backend (no patches — they use /etc/homeproxy which is symlinked) ──
@@ -70,6 +71,10 @@ MANIFEST = [
     ("root/etc/homeproxy/scripts/update_crond.sh",    f"{SCR}/update_crond.sh",
         [('LUA_DIR="/usr/lib/homeproxy"', f'LUA_DIR="{LIB}"')], "755", "always"),
     ("root/etc/homeproxy/scripts/update_resources.sh",f"{SCR}/update_resources.sh",    [], "755", "always"),
+    # ── web UI (standalone uhttpd, no path patches needed) ──
+    ("root/etc/homeproxy/web/index.html",             f"{WEB}/index.html",             [], "644", "always"),
+    ("root/etc/homeproxy/web/cgi-bin/api",           f"{WEB}/cgi-bin/api",            [], "755", "always"),
+    ("root/etc/init.d/homeproxy-web",                "/etc/init.d/homeproxy-web",     [], "755", "always"),
     # ── init.d (patch HP_LUA_DIR + sing-box fallback) ──
     ("root/etc/init.d/homeproxy",                     "/etc/init.d/homeproxy",
         [('HP_LUA_DIR="/usr/lib/homeproxy"', f'HP_LUA_DIR="{LIB}"'),
@@ -249,7 +254,7 @@ def backup(rt: Router):
     print("\n[2/8] Backing up existing install...")
     # Gather paths that exist
     paths = []
-    for p in ["/etc/init.d/homeproxy", "/etc/config/homeproxy",
+    for p in ["/etc/init.d/homeproxy", "/etc/init.d/homeproxy-web", "/etc/config/homeproxy",
               "/etc/homeproxy", HP_BASE, "/etc/profile.d/homeproxy.sh"]:
         rc, _, _ = rt.run(f"test -e {p} && echo yes || echo no")
         if rc == 0:
@@ -467,6 +472,16 @@ uci -q commit firewall""")
         print(f"    stderr: {err}")
     else:
         print("  ✓ service started")
+
+    # start the web UI (separate procd instance; survives proxy restarts)
+    print("  → starting homeproxy-web UI...")
+    rt.run("/etc/init.d/homeproxy-web enable 2>/dev/null; true")
+    rcw, outw, errw = rt.run("/etc/init.d/homeproxy-web start 2>&1", timeout=15)
+    if rcw == 0:
+        rc_lip, lip, _ = rt.run("uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.31.1")
+        print("  ✓ web UI started → http://%s:8910/" % (lip.strip() or "192.168.31.1"))
+    else:
+        print("  ⚠ web UI start returned rc=%s: %s" % (rcw, errw))
 
     # verify sing-box is running
     time.sleep(2)
