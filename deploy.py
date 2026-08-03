@@ -51,6 +51,7 @@ RES = f"{HP_BASE}/resources"
 SCR = f"{HP_BASE}/scripts"
 BIN = f"{HP_BASE}/bin"
 WEB = f"{HP_BASE}/web"
+INITD_PERSIST = f"{HP_BASE}/init.d"  # persistent init.d copies (reboot restore)
 
 MANIFEST = [
     # ── Lua backend (no patches — they use /etc/homeproxy which is symlinked) ──
@@ -74,11 +75,13 @@ MANIFEST = [
     # ── web UI (standalone uhttpd, no path patches needed) ──
     ("root/etc/homeproxy/web/index.html",             f"{WEB}/index.html",             [], "644", "always"),
     ("root/etc/homeproxy/web/cgi-bin/api",           f"{WEB}/cgi-bin/api",            [], "755", "always"),
-    ("root/etc/init.d/homeproxy-web",                "/etc/init.d/homeproxy-web",     [], "755", "always"),
+    ("root/etc/init.d/homeproxy-web",                f"{INITD_PERSIST}/homeproxy-web",[], "755", "always"),
     # ── init.d (patch HP_LUA_DIR + sing-box fallback) ──
-    ("root/etc/init.d/homeproxy",                     "/etc/init.d/homeproxy",
+    ("root/etc/init.d/homeproxy",                     f"{INITD_PERSIST}/homeproxy",
         [('HP_LUA_DIR="/usr/lib/homeproxy"', f'HP_LUA_DIR="{LIB}"'),
          ('PROG="/usr/bin/sing-box"',       f'PROG="{SINGBOX}"')], "755", "always"),
+    # ── reboot auto-restore (LuCI-less MiWiFi: /etc is ramfs) ──
+    ("root/etc/homeproxy/scripts/boot_restore.sh", f"{HP_BASE}/boot_restore.sh",     [], "755", "always"),
     # ── default UCI config (never overwrite user config unless --force) ──
     ("root/etc/config/homeproxy",                     "/etc/config/homeproxy",         [], "644", "if_missing"),
 ]
@@ -464,6 +467,14 @@ uci -q set firewall.homeproxy.reload='1'
 uci -q set firewall.homeproxy.enabled='1'
 uci -q commit firewall""")
 
+    # link volatile /etc/init.d -> persistent patched copies, and install
+    # the reboot auto-restore hooks (auto_start.sh + cron watchdog).
+    print("  → linking init.d + installing reboot auto-restore hooks...")
+    rt.run("mkdir -p /etc/init.d", timeout=10)
+    rt.run(f"ln -sfn {INITD_PERSIST}/homeproxy /etc/init.d/homeproxy", timeout=10)
+    rt.run(f"ln -sfn {INITD_PERSIST}/homeproxy-web /etc/init.d/homeproxy-web", timeout=10)
+    rt.run(r"""grep -q 'homeproxy/boot_restore.sh' /data/auto_start.sh 2>/dev/null || printf '\n# homeproxy auto-restore (LuCI-less MiWiFi port)\n[ -x /data/other_vol/homeproxy/boot_restore.sh ] && /data/other_vol/homeproxy/boot_restore.sh\n' >> /data/auto_start.sh""", timeout=15)
+    rt.run(r"""crontab -l 2>/dev/null | grep -v 'homeproxy/boot_restore.sh' | { cat; echo '*/5 * * * * /data/other_vol/homeproxy/boot_restore.sh'; } | crontab -""", timeout=15)
     # start service
     print("  → starting homeproxy service...")
     rc, out, err = rt.run("/etc/init.d/homeproxy start 2>&1", timeout=30)
