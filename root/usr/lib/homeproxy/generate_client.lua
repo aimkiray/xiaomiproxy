@@ -437,11 +437,11 @@ if not isEmpty(main_node) then
         if proxy_domain_list and #proxy_domain_list > 0 then
             push(config.dns.rules, { rule_set = "proxy-domain", action = "route", server = "main-dns" })
         end
-        push(config.dns.rules, { rule_set = "geosite-cn", action = "route", server = "china-dns" })
+        push(config.dns.rules, { rule_set = "geosite-cn", action = "route", server = "china-dns", strategy = "prefer_ipv6" })
         push(config.dns.rules, {
             type = "logical", mode = "and",
             rules = { { rule_set = "geosite-noncn", invert = true }, { rule_set = "geoip-cn" } },
-            action = "route", server = "china-dns",
+            action = "route", server = "china-dns", strategy = "prefer_ipv6",
         })
     end
 elseif not isEmpty(default_outbound) then
