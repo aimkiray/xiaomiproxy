@@ -154,22 +154,47 @@ start_service() {
     sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"
     : > "$RUN_DIR/firewall.active"
 
-    # dnsmasq integration for gfwlist: forward GFW domains to sing-box DNS and
-    # populate the homeproxy_gfw4[/6] ipset so the firewall only proxies them.
-    if [ "$outbound_node" != "nil" ] && [ "$routing_mode" = "gfwlist" ]; then
-        local hp_ipv6 hp_dns_port gfw_v6=""
+    # DNS steering via dnsmasq conf-dir (mirrors upstream init.homeproxy):
+    # dnsmasq forwards selected domains to sing-box DNS (infra.dns_port) and,
+    # where needed, populates an ipset the firewall matches against. The
+    # firewall.sh run above already created those ipsets.
+    if [ "$outbound_node" != "nil" ]; then
+        local hp_ipv6 hp_dns_port gfw_v6="" wan_v6=""
         config_get_bool hp_ipv6 "config" "ipv6_support" "0"
         config_get hp_dns_port "infra" "dns_port" "5333"
-        [ "$hp_ipv6" = "1" ] && gfw_v6=",homeproxy_gfw6"
-        if [ -s "$HP_DIR/resources/gfw_list.txt" ]; then
-            mkdir -p /tmp/dnsmasq.d
-            awk -v dp="$hp_dns_port" -v v6="$gfw_v6" \
-                'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_gfw4"v6}' \
-                "$HP_DIR/resources/gfw_list.txt" > /tmp/dnsmasq.d/homeproxy_gfw.conf
-            /etc/init.d/dnsmasq restart >/dev/null 2>&1
-        else
-            log "Warning: gfw_list.txt missing -- gfwlist mode will not split traffic."
+        [ "$hp_ipv6" = "1" ] && { gfw_v6=",homeproxy_gfw6"; wan_v6=",homeproxy_wan_proxy6"; }
+        mkdir -p /tmp/dnsmasq.d
+        case "$routing_mode" in
+        "bypass_mainland_china"|"custom"|"global")
+            # forward ALL queries to sing-box DNS; sing-box splits CN/non-CN.
+            printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$hp_dns_port" > /tmp/dnsmasq.d/homeproxy_redirect_dns.conf
+            ;;
+        "gfwlist")
+            if [ -s "$HP_DIR/resources/gfw_list.txt" ]; then
+                awk -v dp="$hp_dns_port" -v v6="$gfw_v6" \
+                    'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_gfw4"v6}' \
+                    "$HP_DIR/resources/gfw_list.txt" > /tmp/dnsmasq.d/homeproxy_gfw.conf
+            else
+                log "Warning: gfw_list.txt missing -- gfwlist mode will not split traffic."
+            fi
+            ;;
+        "proxy_mainland_china")
+            if [ -s "$HP_DIR/resources/china_list.txt" ]; then
+                awk -v dp="$hp_dns_port" \
+                    'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp}' \
+                    "$HP_DIR/resources/china_list.txt" > /tmp/dnsmasq.d/homeproxy_china_list.conf
+            else
+                log "Warning: china_list.txt missing -- proxy_mainland_china DNS not split."
+            fi
+            ;;
+        esac
+        # proxy_list.txt: always-proxy domains -> sing-box DNS + wan_proxy ipset.
+        if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/proxy_list.txt" ]; then
+            awk -v dp="$hp_dns_port" -v v6="$wan_v6" \
+                'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_wan_proxy4"v6}' \
+                "$HP_DIR/resources/proxy_list.txt" > /tmp/dnsmasq.d/homeproxy_proxy_list.conf
         fi
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
 
     log "HomeProxy started (sing-box: $("$PROG" version -n 2>/dev/null | head -1))."
@@ -182,9 +207,9 @@ stop_service() {
     sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
     rm -f "$RUN_DIR/firewall.active"
 
-    # remove dnsmasq gfwlist integration
-    if [ -f /tmp/dnsmasq.d/homeproxy_gfw.conf ]; then
-        rm -f /tmp/dnsmasq.d/homeproxy_gfw.conf
+    # remove dnsmasq DNS steering (any routing mode)
+    if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
+        rm -f /tmp/dnsmasq.d/homeproxy_*.conf
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
 
