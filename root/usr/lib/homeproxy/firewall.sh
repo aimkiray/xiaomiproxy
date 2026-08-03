@@ -38,6 +38,9 @@ esac
 [ -z "$lan_if" ] && lan_if=br-lan
 # If the chosen iface does not exist, omit the ingress filter (apply to all).
 [ -n "$lan_if" ] && ! ip link show "$lan_if" >/dev/null 2>&1 && lan_if=""
+# Ingress filter arg: "-i <iface>" when detected, empty to apply to all.
+IFARG=""
+[ -n "$lan_if" ] && IFARG="-i $lan_if"
 lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
 lan_mask=$(uci -q get network.lan.netmask 2>/dev/null)
 lan_net=""
@@ -64,16 +67,15 @@ IP6=ip6tables
 # --- teardown -------------------------------------------------------------
 stop_fw() {
     for ip in $IP4 $IP6; do
-        [ "$ip" = "$IP6" ] && [ "$ipv6" != "1" ] && continue
-        $ip -t nat    -D PREROUTING -i "$lan_if" -p tcp -j homeproxy_redir 2>/dev/null
-        $ip -t nat    -D PREROUTING -i "$lan_if" -p udp --dport 53 -j homeproxy_dns 2>/dev/null
-        $ip -t mangle -D PREROUTING -i "$lan_if" -p udp -j homeproxy_mangle 2>/dev/null
+        $ip -t nat    -D PREROUTING $IFARG -p tcp -j homeproxy_redir 2>/dev/null
+        $ip -t nat    -D PREROUTING $IFARG -p udp --dport 53 -j homeproxy_dns 2>/dev/null
+        $ip -t mangle -D PREROUTING $IFARG -p udp -j homeproxy_mangle 2>/dev/null
         $ip -t nat    -F homeproxy_dns 2>/dev/null;     $ip -t nat -X homeproxy_dns 2>/dev/null
         $ip -t nat    -F homeproxy_redir 2>/dev/null;   $ip -t nat -X homeproxy_redir 2>/dev/null
         $ip -t mangle -F homeproxy_mangle 2>/dev/null;  $ip -t mangle -X homeproxy_mangle 2>/dev/null
     done
     ipset destroy homeproxy_cn4 2>/dev/null
-    [ "$ipv6" = "1" ] && ipset destroy homeproxy_cn6 2>/dev/null
+    ipset destroy homeproxy_cn6 2>/dev/null
 }
 
 [ "$1" = "stop" ] && { stop_fw; exit 0; }
@@ -98,6 +100,13 @@ build_ipset() {
 if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; then
     build_ipset homeproxy_cn4 "$RES_DIR/china_ip4.txt" inet
     [ "$ipv6" = "1" ] && build_ipset homeproxy_cn6 "$RES_DIR/china_ip6.txt" inet6
+fi
+# Warn loudly if a CN-dependent mode has no usable ipset, otherwise
+# bypass_mainland_china silently degrades to "proxy everything".
+if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; then
+    cn_cnt=$(ipset list homeproxy_cn4 2>/dev/null | awk '/Number of entries/{print $4}')
+    [ -z "$cn_cnt" ] && cn_cnt=0
+    [ "$cn_cnt" -le 0 ] && echo "homeproxy: WARNING: CN ipset empty/missing ($RES_DIR/china_ip4.txt) -- $routing_mode will proxy all traffic." >&2
 fi
 
 cnset4=homeproxy_cn4
@@ -167,7 +176,8 @@ emit_control() {
 apply_tcp() {
     local ip="$1" cnset="$2"
     $ip -t nat -N homeproxy_redir 2>/dev/null || $ip -t nat -F homeproxy_redir
-    $ip -t nat -A PREROUTING -i "$lan_if" -p tcp -j homeproxy_redir
+    $ip -t nat -D PREROUTING $IFARG -p tcp -j homeproxy_redir 2>/dev/null
+    $ip -t nat -A PREROUTING $IFARG -p tcp -j homeproxy_redir
     emit_skip "$ip" nat homeproxy_redir
     emit_routing "$ip" nat homeproxy_redir "$cnset"
     emit_control "$ip" nat homeproxy_redir "-p tcp -j REDIRECT --to-ports $redirect_port"
@@ -177,9 +187,12 @@ apply_tcp() {
 apply_udp() {
     local ip="$1" cnset="$2"
     $ip -t mangle -N homeproxy_mangle 2>/dev/null || $ip -t mangle -F homeproxy_mangle
-    $ip -t mangle -A PREROUTING -i "$lan_if" -p udp -j homeproxy_mangle
+    $ip -t mangle -D PREROUTING $IFARG -p udp -j homeproxy_mangle 2>/dev/null
+    $ip -t mangle -A PREROUTING $IFARG -p udp -j homeproxy_mangle
     emit_skip "$ip" mangle homeproxy_mangle
     emit_routing "$ip" mangle homeproxy_mangle "$cnset"
+    # leave DNS to the nat-table hijack (homeproxy_dns), not TPROXY
+    $ip -t mangle -A homeproxy_mangle -p udp --dport 53 -j RETURN
     # do not proxy QUIC over UDP (let clients fall back to TCP)
     $ip -t mangle -A homeproxy_mangle -p udp --dport 443 -j RETURN
     local tproxy_act="-p udp -j TPROXY --on-port $tproxy_port --tproxy-mark $tproxy_mark/$tproxy_mark"
@@ -193,7 +206,9 @@ apply_udp() {
 apply_dns() {
     local ip="$1"
     $ip -t nat -N homeproxy_dns 2>/dev/null || $ip -t nat -F homeproxy_dns
-    $ip -t nat -A PREROUTING -i "$lan_if" -p udp --dport 53 -j homeproxy_dns
+    $ip -t nat -D PREROUTING $IFARG -p udp --dport 53 -j homeproxy_dns 2>/dev/null
+    $ip -t nat -A PREROUTING $IFARG -p udp --dport 53 -j homeproxy_dns
+    emit_skip "$ip" nat homeproxy_dns
     $ip -t nat -A homeproxy_dns -p udp --dport 53 -j REDIRECT --to-ports "$dns_port"
 }
 
