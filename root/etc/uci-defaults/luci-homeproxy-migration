@@ -1,5 +1,5 @@
 #!/bin/sh
-
-ucode "/etc/homeproxy/scripts/migrate_config.uc"
-
+# SPDX-License-Identifier: GPL-2.0-only
+# Run HomeProxy config migration/defaults once at first boot.
+lua /usr/lib/homeproxy/migrate_config.lua
 exit 0

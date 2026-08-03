@@ -1,5 +1,42 @@
-TODO:
-- Subscription page slow response with a large number of nodes
-- Refactor nft rules
-- Move ACL settings to a dedicated page
-- Any other improvements
+homeproxy (MiWiFi / iptables port)
+=================================
+
+A sing-box front-end for routers without LuCI, ucode, or nftables (e.g. stock
+Xiaomi/MiWiFi). The original luci-app-homeproxy (LuCI JS + ucode + fw4/nftables)
+is replaced by:
+
+  * Lua backend (on-device `lua 5.1` + `luci.json` + `uci` binding)
+  * iptables + ipset traffic steering (TCP redirect / UDP tproxy / DNS hijack)
+  * a shell CLI (`homeproxy ...`) instead of a web UI
+
+Quick start (on the router, after deploying the files under /):
+
+  homeproxy add "My SS" -- shadowsocks 1.2.3.4 8388 password=secret \
+      shadowsocks_encrypt_method=aes-256-gcm
+  homeproxy main-node <section>          # use `homeproxy nodes` to find it
+  homeproxy routing-mode bypass_mainland_china
+  homeproxy proxy-mode redirect_tproxy
+  homeproxy lan-proxy global             # or listed_only / except_listed
+  homeproxy generate
+  homeproxy restart
+  homeproxy log -f
+
+Subscription update and resource refresh:
+
+  homeproxy subscribe
+  homeproxy update-resources all
+
+Notes
+-----
+  * sing-box is not bundled; install a compatible `sing-box` binary and point
+    `HP_SINGBOX` at it (default `/usr/bin/sing-box`).
+  * On MiWiFi the root filesystem is read-only — place the files on a writable
+    layer (e.g. /data with symlinks, or rebuild the firmware) and keep
+    `/etc/config/homeproxy` on the persistent config partition.
+  * Only TCP redirect + UDP tproxy (+ DNS hijack) modes are wired for iptables;
+    the `tun` mode requires the tun kmod and is best-effort.
+
+TODO
+----
+  * TUN mode hardening on stock kernels
+  * Server-side TLS ACME on devices without a writable cert store

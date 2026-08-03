@@ -29,15 +29,12 @@ fi
 TEMP_DIR="$(mktemp -d -p $BASE_DIR)"
 TEMP_PKG_DIR="$TEMP_DIR/$PKG_NAME"
 mkdir -p "$TEMP_PKG_DIR/lib/upgrade/keep.d/"
-mkdir -p "$TEMP_PKG_DIR/usr/lib/lua/luci/i18n/"
-mkdir -p "$TEMP_PKG_DIR/www/"
 if [ "$PKG_MGR" == "apk" ]; then
 	mkdir -p "$TEMP_PKG_DIR/lib/apk/packages/"
 else
 	mkdir -p "$TEMP_PKG_DIR/CONTROL/"
 fi
 
-cp -fpR "$PKG_DIR/htdocs"/* "$TEMP_PKG_DIR/www/"
 cp -fpR "$PKG_DIR/root"/* "$TEMP_PKG_DIR/"
 
 cat > "$TEMP_PKG_DIR/lib/upgrade/keep.d/$PKG_NAME" <<-EOF
@@ -47,7 +44,6 @@ cat > "$TEMP_PKG_DIR/lib/upgrade/keep.d/$PKG_NAME" <<-EOF
 /etc/homeproxy/resources/proxy_list.txt
 EOF
 
-po2lmo "$PKG_DIR/po/zh_Hans/homeproxy.po" "$TEMP_PKG_DIR/usr/lib/lua/luci/i18n/homeproxy.zh-cn.lmo"
 
 if [ "$PKG_MGR" == "apk" ]; then
 	find "$TEMP_PKG_DIR" -type f,l -printf '/%P\n' | sort > "$TEMP_PKG_DIR/lib/apk/packages/$PKG_NAME.list"
@@ -97,7 +93,7 @@ default_prerm' > "$TEMP_DIR/pre-deinstall"
 	apk mkpkg \
 		--info "name:$PKG_NAME" \
 		--info "version:$PKG_VERSION" \
-		--info "description:The modern ImmortalWrt proxy platform for ARM64/AMD64" \
+		--info "description:Modern sing-box proxy for iptables-only (MiWiFi) routers" \
 		--info "arch:noarch" \
 		--info "origin:https://github.com/immortalwrt/homeproxy" \
 		--info "url:" \
@@ -106,7 +102,7 @@ default_prerm' > "$TEMP_DIR/pre-deinstall"
 		--script "post-install:$TEMP_DIR/post-install" \
 		--script "post-upgrade:$TEMP_DIR/post-upgrade" \
 		--script "pre-deinstall:$TEMP_DIR/pre-deinstall" \
-		--info "depends:libc sing-box firewall4 kmod-nft-tproxy ucode-mod-digest" \
+		--info "depends:libc sing-box lua iptables iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-ipset kmod-ipt-ipset ipset" \
 		--files "$TEMP_PKG_DIR" \
 		--output "$TEMP_DIR/${PKG_NAME}_${PKG_VERSION}.apk"
 
@@ -117,15 +113,15 @@ else
 	cat > "$TEMP_PKG_DIR/CONTROL/control" <<-EOF
 		Package: $PKG_NAME
 		Version: $PKG_VERSION
-		Depends: libc, sing-box, firewall4, kmod-nft-tproxy, ucode-mod-digest
+		Depends: libc, sing-box, lua, iptables, iptables-mod-tproxy, kmod-ipt-tproxy, iptables-mod-ipset, kmod-ipt-ipset, ipset
 		Source: https://github.com/immortalwrt/homeproxy
 		SourceName: $PKG_NAME
-		Section: luci
+		Section: net
 		SourceDateEpoch: $PKG_SOURCE_DATE_EPOCH
 		Maintainer: Tianling Shen <cnsztl@immortalwrt.org>
 		Architecture: all
 		Installed-Size: TO-BE-FILLED-BY-IPKG-BUILD
-		Description:  The modern ImmortalWrt proxy platform for ARM64/AMD64
+		Description:  Modern sing-box proxy for iptables-only (MiWiFi) routers
 	EOF
 	chmod 0644 "$TEMP_PKG_DIR/CONTROL/control"
 

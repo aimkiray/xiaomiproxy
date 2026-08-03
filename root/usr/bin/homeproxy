@@ -1,0 +1,117 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# homeproxy CLI -- manage HomeProxy on LuCI-less routers (MiWiFi).
+# Usage: homeproxy <command> [args]
+#   start|stop|restart|reload|status   service control
+#   enable|disable                     boot autostart
+#   generate                           regenerate sing-box configs
+#   migrate                             apply config defaults/migration
+#   subscribe                          update subscriptions now
+#   update-resources [all|china_ip4|china_ip6|gfw_list|china_list]
+#   nodes                              list proxy nodes
+#   node <name>                         show one node
+#   main-node [name|urltest|nil]        get/set main node
+#   routing-mode [mode]                get/set routing_mode
+#   proxy-mode [mode]                  get/set proxy_mode
+#   lan-proxy [mode]                    get/set lan_proxy_mode
+#   add <label> -- <type> <addr> <port> [key=val ...]
+#   del <name>                          delete a node
+#   set <section.option> <value>       set a uci option
+#   get <section.option>                get a uci option
+#   show                               dump the whole config
+#   log [-f]                            show / tail the log
+
+CONF=homeproxy
+INIT=/etc/init.d/$CONF
+LUA_DIR=/usr/lib/homeproxy
+HP_DIR=/etc/homeproxy
+RUN_DIR=/var/run/homeproxy
+LOG_PATH=$RUN_DIR/$CONF.log
+
+die() { echo "homeproxy: $*" >&2; exit 1; }
+uci_set() { uci set "$CONF.$1" "$2" 2>/dev/null && uci commit "$CONF"; }
+uci_get() { uci -q get "$CONF.$1" 2>/dev/null; }
+
+cmd_status() {
+    pgrep -f "sing-box run --config $RUN_DIR/sing-box" >/dev/null 2>&1 \
+        && echo "running" || echo "stopped"
+}
+
+cmd_nodes() {
+    echo "NAME                                LABEL                      TYPE        ADDRESS:PORT"
+    uci -q show "$CONF" 2>/dev/null | awk -F= '
+        /^homeproxy\.[^.]+=node/ { name=$1; sub(/^homeproxy\./,"",name); next }
+        name && /\.label=/   { label=$2 }
+        name && /\.type=/     { type=$2 }
+        name && /\.address=/  { addr=$2 }
+        name && /\.port=/     { port=$2; gsub(/^[ \047]*|[ \047]*$/,"",label); gsub(/^[ \047]*|[ \047]*$/,"",type); gsub(/^[ \047]*|[ \047]*$/,"",addr); gsub(/^[ \047]*|[ \047]*$/,"",port); printf "%-36s %-26s %-11s %s:%s\n", name, label, type, addr, port; name=label=type=addr=port="" }
+    '
+}
+
+cmd_add() {
+    local label="" rest=0 type addr port name
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--" ]; then rest=1; shift; break; fi
+        [ -z "$label" ] && label="$1"; shift
+    done
+    [ "$rest" = "1" ] && [ $# -ge 3 ] || die "usage: homeproxy add <label> -- <type> <addr> <port> [key=val ...]"
+    type="$1"; addr="$2"; port="$3"; shift 3
+    name="$(printf '%s' "$label" | md5sum | cut -c1-32)"
+    uci set "$CONF.$name=node" || die "failed to create node section"
+    uci set "$CONF.$name.label=$label"
+    uci set "$CONF.$name.type=$type"
+    uci set "$CONF.$name.address=$addr"
+    uci set "$CONF.$name.port=$port"
+    for kv in "$@"; do
+        case "$kv" in *=*) uci set "$CONF.$name.$kv" ;; *) echo "homeproxy: ignoring bad key=val '$kv'" >&2 ;; esac
+    done
+    uci commit "$CONF" || die "commit failed"
+    echo "Added node '$label' as section $name. Run 'homeproxy generate' then restart."
+}
+
+cmd_del() {
+    [ -n "$1" ] || die "usage: homeproxy del <name>"
+    uci delete "$CONF.$1" 2>/dev/null || die "no such node $1"
+    uci commit "$CONF"
+    echo "Deleted node $1."
+}
+
+cmd_set() { [ $# -ge 2 ] || die "usage: homeproxy set <section.option> <value>"; local key="$1"; shift; uci_set "$key" "$*"; echo "Set $key = $*"; }
+cmd_get() { [ -n "$1" ] || die "usage: homeproxy get <section.option>"; uci_get "$1"; }
+
+case "$1" in
+start|stop|restart|reload) shift; "$INIT" "$1" ;;
+status) cmd_status ;;
+enable) "$INIT" enable && echo "Enabled $CONF at boot." ;;
+disable) "$INIT" disable && echo "Disabled $CONF at boot." ;;
+generate)
+    mkdir -p "$RUN_DIR"
+    lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
+    [ "$(uci -q get $CONF.config.main_node)" != "nil" ] && lua "$LUA_DIR/generate_client.lua" || true
+    [ "$(uci -q get $CONF.server.enabled)" = "1" ] && lua "$LUA_DIR/generate_server.lua" || true
+    echo "Configs generated in $RUN_DIR."
+    ;;
+migrate) lua "$LUA_DIR/migrate_config.lua" && echo "Migration applied." ;;
+subscribe) lua "$LUA_DIR/update_subscriptions.lua" ;;
+update-resources)
+    shift
+    if [ -z "$1" ] || [ "$1" = "all" ]; then
+        for i in china_ip4 china_ip6 gfw_list china_list; do "$HP_DIR/scripts/update_resources.sh" "$i"; done
+    else "$HP_DIR/scripts/update_resources.sh" "$1"; fi
+    ;;
+nodes) cmd_nodes ;;
+node) [ -n "$2" ] && uci -q show "$CONF.$2" || die "usage: homeproxy node <name>" ;;
+main-node)   if [ -z "$2" ]; then uci_get "config.main_node"; else uci_set "config.main_node" "$2" && echo "main_node=$2"; fi ;;
+routing-mode) if [ -z "$2" ]; then uci_get "config.routing_mode"; else uci_set "config.routing_mode" "$2" && echo "routing_mode=$2"; fi ;;
+proxy-mode)  if [ -z "$2" ]; then uci_get "config.proxy_mode"; else uci_set "config.proxy_mode" "$2" && echo "proxy_mode=$2"; fi ;;
+lan-proxy)   if [ -z "$2" ]; then uci_get "control.lan_proxy_mode"; else uci_set "control.lan_proxy_mode" "$2" && echo "lan_proxy_mode=$2"; fi ;;
+add) shift; cmd_add "$@" ;;
+del) cmd_del "$2" ;;
+set) shift; cmd_set "$@" ;;
+get) cmd_get "$2" ;;
+show) uci -q show "$CONF" ;;
+log) if [ "$2" = "-f" ]; then tail -F "$LOG_PATH" 2>/dev/null || echo "no log yet"; else tail -n 50 "$LOG_PATH" 2>/dev/null || echo "no log yet"; fi ;;
+""|-h|--help|help) sed -n '4,21p' "$0" 2>/dev/null ;;
+*) die "unknown command '$1' (try: homeproxy help)" ;;
+esac

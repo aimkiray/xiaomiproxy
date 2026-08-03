@@ -1,0 +1,711 @@
+#!/usr/bin/lua
+-- SPDX-License-Identifier: GPL-2.0-only
+-- HomeProxy client config generator (Lua port of generate_client.uc).
+-- Reads /etc/config/homeproxy via the uci Lua binding and emits the
+-- sing-box client JSON to /var/run/homeproxy/sing-box-c.json.
+
+package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
+
+local hp   = require("homeproxy")
+local uci  = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
+
+local UCICONFIG = "homeproxy"
+uci:load(UCICONFIG)
+
+local UCIINFRA = "infra"
+local UCIMAIN  = "config"
+local UCICONTROL = "control"
+local UCIDNS = "dns"
+local UCIDNSSERVER = "dns_server"
+local UCIDNSRULE = "dns_rule"
+local UCIROUTING = "routing"
+local UCIROUTINGNODE = "routing_node"
+local UCIROUTINGRULE = "routing_rule"
+local UCINODE = "node"
+local UCIRULESET = "ruleset"
+
+local function uget(sec, opt) return uci:get(UCICONFIG, sec, opt) end
+local function isEmpty(v) return hp.isEmpty(v) end
+local function strToBool(v) return hp.strToBool(v) end
+local function strToInt(v) return hp.strToInt(v) end
+local function strToTime(v) return hp.strToTime(v) end
+local function push(t, v) t[#t + 1] = v end
+local function map(arr, fn)
+    if not arr then return nil end
+    if type(arr) ~= "table" then arr = { arr } end
+    local out = {}
+    for i, v in ipairs(arr) do out[i] = fn(v) end
+    return out
+end
+local function filter(arr, fn)
+    if not arr then return {} end
+    if type(arr) ~= "table" then arr = { arr } end
+    local out = {}
+    for _, v in ipairs(arr) do if fn(v) then out[#out + 1] = v end end
+    return out
+end
+local function contains(arr, val)
+    if not arr then return false end
+    if type(arr) ~= "table" then arr = { arr } end
+    for _, v in ipairs(arr) do if v == val then return true end end
+    return false
+end
+
+local function get_wan_dns()
+    for _, p in ipairs({ "/tmp/resolv.conf.auto", "/tmp/resolv.conf.d/resolv.conf.auto",
+                        "/tmp/resolv.conf" }) do
+        local f = io.open(p, "r")
+        if f then
+            for line in f:lines() do
+                local ns = line:match("^%s*nameserver%s+([%d%.:%a]+)")
+                if ns then f:close(); return ns end
+            end
+            f:close()
+        end
+    end
+    return uci:get("network", "wan", "dns")
+end
+
+local routing_mode = uget(UCIMAIN, "routing_mode") or "bypass_mainland_china"
+
+local wan_dns = get_wan_dns()
+if isEmpty(wan_dns) then
+    wan_dns = (routing_mode == "proxy_mainland_china" or routing_mode == "global")
+        and "8.8.8.8" or "223.5.5.5"
+end
+
+local dns_port = uget(UCIINFRA, "dns_port") or "5333"
+local ntp_server = uget(UCIINFRA, "ntp_server") or "time.apple.com"
+local ipv6_support = uget(UCIMAIN, "ipv6_support") or "0"
+
+local main_node, main_udp_node, dedicated_udp_node, default_outbound, default_outbound_dns,
+      domain_strategy, sniff_override, dns_server, china_dns_server, dns_default_strategy,
+      dns_default_server, dns_disable_cache, dns_disable_cache_expire, dns_independent_cache,
+      dns_client_subnet, cache_file_store_rdrc, cache_file_rdrc_timeout,
+      direct_domain_list, proxy_domain_list
+
+if routing_mode ~= "custom" then
+    main_node = uget(UCIMAIN, "main_node") or "nil"
+    main_udp_node = uget(UCIMAIN, "main_udp_node") or "nil"
+    dedicated_udp_node = not isEmpty(main_udp_node)
+        and main_udp_node ~= "same" and main_udp_node ~= main_node
+
+    dns_server = uget(UCIMAIN, "dns_server")
+    if isEmpty(dns_server) or dns_server == "wan" then dns_server = wan_dns end
+
+    if routing_mode == "bypass_mainland_china" then
+        china_dns_server = uget(UCIMAIN, "china_dns_server")
+        if isEmpty(china_dns_server) or type(china_dns_server) ~= "string" or china_dns_server == "wan" then
+            china_dns_server = wan_dns
+        end
+    end
+    dns_default_strategy = (ipv6_support ~= "1") and "ipv4_only" or nil
+
+    local function load_list(name)
+        local d = hp.trim(hp.readfile(hp.HP_DIR .. "/resources/" .. name))
+        if not d then return nil end
+        local raw = hp.split(d, "[\r\n]+")
+        local cl = {}
+        for _, v in ipairs(raw) do if v ~= "" then cl[#cl + 1] = v end end
+        return next(cl) ~= nil and cl or nil
+    end
+    direct_domain_list = load_list("direct_list.txt")
+    proxy_domain_list  = load_list("proxy_list.txt")
+
+    sniff_override = uget(UCIINFRA, "sniff_override") or "1"
+else
+    dns_default_strategy  = uget(UCIDNS, "default_strategy")
+    dns_default_server     = uget(UCIDNS, "default_server")
+    dns_disable_cache      = uget(UCIDNS, "disable_cache")
+    dns_disable_cache_expire = uget(UCIDNS, "disable_cache_expire")
+    dns_independent_cache  = uget(UCIDNS, "independent_cache")
+    dns_client_subnet      = uget(UCIDNS, "client_subnet")
+    cache_file_store_rdrc  = uget(UCIDNS, "cache_file_store_rdrc")
+    cache_file_rdrc_timeout = uget(UCIDNS, "cache_file_rdrc_timeout")
+
+    default_outbound       = uget(UCIROUTING, "default_outbound") or "nil"
+    default_outbound_dns   = uget(UCIROUTING, "default_outbound_dns") or "default-dns"
+    domain_strategy        = uget(UCIROUTING, "domain_strategy")
+    sniff_override         = uget(UCIROUTING, "sniff_override")
+end
+
+local proxy_mode = uget(UCIMAIN, "proxy_mode") or "redirect_tproxy"
+local default_interface = uget(UCICONTROL, "bind_interface")
+local mixed_port = uget(UCIINFRA, "mixed_port") or "5330"
+
+local self_mark, redirect_port, tproxy_port, tun_name,
+      tun_addr4, tun_addr6, tun_mtu, tcpip_stack,
+      endpoint_independent_nat, udp_timeout
+
+if routing_mode == "custom" then
+    udp_timeout = uget(UCIROUTING, "udp_timeout")
+else
+    udp_timeout = uget(UCIINFRA, "udp_timeout")
+end
+
+if proxy_mode:find("redirect") then
+    self_mark = uget(UCIINFRA, "self_mark") or "100"
+    redirect_port = uget(UCIINFRA, "redirect_port") or "5331"
+end
+if proxy_mode:find("tproxy") and (main_udp_node ~= "nil" or routing_mode == "custom") then
+    tproxy_port = uget(UCIINFRA, "tproxy_port") or "5332"
+end
+if proxy_mode:find("tun") then
+    tun_name = uget(UCIINFRA, "tun_name") or "singtun0"
+    tun_addr4 = uget(UCIINFRA, "tun_addr4") or "172.19.0.1/30"
+    tun_addr6 = uget(UCIINFRA, "tun_addr6") or "fdfe:dcba:9876::1/126"
+    tun_mtu = uget(UCIINFRA, "tun_mtu") or "9000"
+    tcpip_stack = "system"
+    if routing_mode == "custom" then
+        tcpip_stack = uget(UCIROUTING, "tcpip_stack") or "system"
+        endpoint_independent_nat = uget(UCIROUTING, "endpoint_independent_nat")
+    end
+end
+
+local log_level = uget(UCIMAIN, "log_level") or "warn"
+
+-- config helpers
+local function parse_port(strport)
+    if type(strport) ~= "table" or isEmpty(strport) then return nil end
+    return map(strport, function(i) return tonumber(i) end)
+end
+
+local function parse_dnsserver(server_addr, default_protocol)
+    if isEmpty(server_addr) then return nil end
+    if not tostring(server_addr):find("://") then
+        server_addr = (default_protocol or "udp") .. "://"
+            .. (hp.validation("ip6addr", server_addr) and ("[" .. server_addr .. "]") or server_addr)
+    end
+    server_addr = hp.parseURL(server_addr)
+    if not server_addr then return nil end
+    return {
+        type = server_addr.protocol,
+        server = server_addr.hostname,
+        server_port = strToInt(server_addr.port),
+        path = (server_addr.pathname ~= "/") and server_addr.pathname or nil,
+    }
+end
+
+local function parse_dnsquery(strquery)
+    if type(strquery) ~= "table" or isEmpty(strquery) then return nil end
+    local out = {}
+    for _, i in ipairs(strquery) do
+        local n = tonumber(i)
+        out[#out + 1] = n or i
+    end
+    return out
+end
+
+local function generate_endpoint(node)
+    if type(node) ~= "table" or isEmpty(node) then return nil end
+    return {
+        type = node.type,
+        tag = "cfg-" .. node[".name"] .. "-out",
+        address = node.wireguard_local_address,
+        mtu = strToInt(node.wireguard_mtu),
+        private_key = node.wireguard_private_key,
+        peers = (node.type == "wireguard") and {
+            {
+                address = node.address,
+                port = strToInt(node.port),
+                allowed_ips = { "0.0.0.0/0", "::/0" },
+                persistent_keepalive_interval = strToInt(node.wireguard_persistent_keepalive_interval),
+                public_key = node.wireguard_peer_public_key,
+                pre_shared_key = node.wireguard_pre_shared_key,
+                reserved = parse_port(node.wireguard_reserved),
+            }
+        } or nil,
+        system = (node.type == "wireguard") and false or nil,
+        tcp_fast_open = strToBool(node.tcp_fast_open),
+        tcp_multi_path = strToBool(node.tcp_multi_path),
+        udp_fragment = strToBool(node.udp_fragment),
+    }
+end
+
+local function generate_outbound(node)
+    if type(node) ~= "table" or isEmpty(node) then return nil end
+    return {
+        type = node.type,
+        tag = "cfg-" .. node[".name"] .. "-out",
+        routing_mark = strToInt(self_mark),
+        server = node.address,
+        server_port = strToInt(node.port),
+        server_ports = node.hysteria_hopping_port,
+        username = (node.type ~= "ssh") and node.username or nil,
+        user = (node.type == "ssh") and node.username or nil,
+        password = node.password,
+        override_address = node.override_address,
+        override_port = strToInt(node.override_port),
+        proxy_protocol = strToInt(node.proxy_protocol),
+        idle_session_check_interval = strToTime(node.anytls_idle_session_check_interval),
+        idle_session_timeout = strToTime(node.anytls_idle_session_timeout),
+        min_idle_session = strToInt(node.anytls_min_idle_session),
+        hop_interval = strToTime(node.hysteria_hop_interval),
+        up_mbps = strToInt(node.hysteria_up_mbps),
+        down_mbps = strToInt(node.hysteria_down_mbps),
+        obfs = node.hysteria_obfs_type and {
+            type = node.hysteria_obfs_type,
+            password = node.hysteria_obfs_password,
+        } or node.hysteria_obfs_password,
+        auth = (node.hysteria_auth_type == "base64") and node.hysteria_auth_payload or nil,
+        auth_str = (node.hysteria_auth_type == "string") and node.hysteria_auth_payload or nil,
+        recv_window_conn = strToInt(node.hysteria_recv_window_conn),
+        recv_window = strToInt(node.hysteria_revc_window),
+        disable_mtu_discovery = strToBool(node.hysteria_disable_mtu_discovery),
+        method = node.shadowsocks_encrypt_method,
+        plugin = node.shadowsocks_plugin,
+        plugin_opts = node.shadowsocks_plugin_opts,
+        version = (node.type == "shadowtls") and strToInt(node.shadowtls_version)
+            or ((node.type == "socks") and node.socks_version or nil),
+        client_version = node.ssh_client_version,
+        host_key = node.ssh_host_key,
+        host_key_algorithms = node.ssh_host_key_algo,
+        private_key = node.ssh_priv_key,
+        private_key_passphrase = node.ssh_priv_key_pp,
+        uuid = node.uuid,
+        congestion_control = node.tuic_congestion_control,
+        udp_relay_mode = node.tuic_udp_relay_mode,
+        udp_over_stream = strToBool(node.tuic_udp_over_stream),
+        zero_rtt_handshake = strToBool(node.tuic_enable_zero_rtt),
+        heartbeat = strToTime(node.tuic_heartbeat),
+        flow = node.vless_flow,
+        alter_id = strToInt(node.vmess_alterid),
+        security = node.vmess_encrypt,
+        global_padding = strToBool(node.vmess_global_padding),
+        authenticated_length = strToBool(node.vmess_authenticated_length),
+        packet_encoding = node.packet_encoding,
+        multiplex = (node.multiplex == "1") and {
+            enabled = true,
+            protocol = node.multiplex_protocol,
+            max_connections = strToInt(node.multiplex_max_connections),
+            min_streams = strToInt(node.multiplex_min_streams),
+            max_streams = strToInt(node.multiplex_max_streams),
+            padding = strToBool(node.multiplex_padding),
+            brutal = (node.multiplex_brutal == "1") and {
+                enabled = true,
+                up_mbps = strToInt(node.multiplex_brutal_up),
+                down_mbps = strToInt(node.multiplex_brutal_down),
+            } or nil,
+        } or nil,
+        tls = (node.tls == "1") and {
+            enabled = true,
+            server_name = node.tls_sni,
+            insecure = strToBool(node.tls_insecure),
+            alpn = node.tls_alpn,
+            min_version = node.tls_min_version,
+            max_version = node.tls_max_version,
+            cipher_suites = node.tls_cipher_suites,
+            certificate_path = node.tls_cert_path,
+            ech = (node.tls_ech == "1") and {
+                enabled = true,
+                config = node.tls_ech_config,
+                config_path = node.tls_ech_config_path,
+            } or nil,
+            utls = not isEmpty(node.tls_utls) and {
+                enabled = true,
+                fingerprint = node.tls_utls,
+            } or nil,
+            reality = (node.tls_reality == "1") and {
+                enabled = true,
+                public_key = node.tls_reality_public_key,
+                short_id = node.tls_reality_short_id,
+            } or nil,
+        } or nil,
+        transport = not isEmpty(node.transport) and {
+            type = node.transport,
+            host = node.http_host or node.httpupgrade_host,
+            path = node.http_path or node.ws_path,
+            headers = node.ws_host and { Host = node.ws_host } or nil,
+            method = node.http_method,
+            max_early_data = strToInt(node.websocket_early_data),
+            early_data_header_name = node.websocket_early_data_header,
+            service_name = node.grpc_servicename,
+            idle_timeout = strToTime(node.http_idle_timeout),
+            ping_timeout = strToTime(node.http_ping_timeout),
+            permit_without_stream = strToBool(node.grpc_permit_without_stream),
+        } or nil,
+        udp_over_tcp = (node.udp_over_tcp == "1") and {
+            enabled = true,
+            version = strToInt(node.udp_over_tcp_version),
+        } or nil,
+        tcp_fast_open = strToBool(node.tcp_fast_open),
+        tcp_multi_path = strToBool(node.tcp_multi_path),
+        udp_fragment = strToBool(node.udp_fragment),
+    }
+end
+
+local function get_outbound(cfg)
+    if isEmpty(cfg) then return nil end
+    if type(cfg) == "table" then
+        if contains(cfg, "any-out") then return "any" end
+        return map(cfg, function(i) return get_outbound(i) end)
+    else
+        if cfg == "block-out" or cfg == "direct-out" then return cfg end
+        local node = uget(cfg, "node")
+        if isEmpty(node) then
+            error(cfg .. "'s node is missing, please check your configuration.")
+        elseif node == "urltest" then
+            return "cfg-" .. cfg .. "-out"
+        else
+            return "cfg-" .. node .. "-out"
+        end
+    end
+end
+
+local function get_resolver(cfg)
+    if isEmpty(cfg) then return nil end
+    if cfg == "default-dns" or cfg == "system-dns" then return cfg end
+    return "cfg-" .. cfg .. "-dns"
+end
+
+local function get_ruleset(cfg)
+    if isEmpty(cfg) then return nil end
+    if type(cfg) ~= "table" then cfg = { cfg } end
+    return map(cfg, function(i) return isEmpty(i) and nil or ("cfg-" .. i .. "-rule") end)
+end
+
+local function get_first(t)
+    local first
+    uci:foreach(UCICONFIG, t, function(s) first = s[".name"]; return false end)
+    return first
+end
+
+-- build config
+local config = {}
+config.log = {
+    disabled = false,
+    level = log_level,
+    output = hp.RUN_DIR .. "/sing-box-c.log",
+    timestamp = true,
+}
+if not isEmpty(ntp_server) and ntp_server ~= "nil" then
+    config.ntp = {
+        enabled = true,
+        server = ntp_server,
+        detour = "direct-out",
+        domain_resolver = "default-dns",
+    }
+end
+
+-- DNS
+config.dns = {
+    servers = {
+        { tag = "default-dns", type = "udp", server = wan_dns,
+          detour = self_mark and "direct-out" or nil },
+        { tag = "system-dns", type = "local",
+          detour = self_mark and "direct-out" or nil },
+    },
+    rules = {},
+    strategy = dns_default_strategy,
+    disable_cache = strToBool(dns_disable_cache),
+    disable_expire = strToBool(dns_disable_cache_expire),
+    independent_cache = strToBool(dns_independent_cache),
+    client_subnet = dns_client_subnet,
+}
+
+if not isEmpty(main_node) then
+    local main_dns = {
+        tag = "main-dns",
+        domain_resolver = { server = "default-dns",
+            strategy = (ipv6_support ~= "1") and "ipv4_only" or nil },
+        detour = "main-out",
+    }
+    for k, v in pairs(parse_dnsserver(dns_server, "tcp") or {}) do main_dns[k] = v end
+    push(config.dns.servers, main_dns)
+    config.dns.final = "main-dns"
+
+    if direct_domain_list and #direct_domain_list > 0 then
+        push(config.dns.rules, {
+            rule_set = "direct-domain", action = "route",
+            server = (routing_mode == "bypass_mainland_china") and "china-dns" or "default-dns",
+        })
+    end
+    if routing_mode == "gfwlist" or (proxy_domain_list and #proxy_domain_list > 0) then
+        push(config.dns.rules, {
+            rule_set = (routing_mode ~= "gfwlist") and "proxy-domain" or nil,
+            query_type = { 64, 65 }, action = "reject",
+        })
+    end
+    if routing_mode == "bypass_mainland_china" then
+        local c_dns = {
+            tag = "china-dns",
+            domain_resolver = { server = "default-dns", strategy = "prefer_ipv6" },
+            detour = self_mark and "direct-out" or nil,
+        }
+        for k, v in pairs(parse_dnsserver(china_dns_server) or {}) do c_dns[k] = v end
+        push(config.dns.servers, c_dns)
+        if proxy_domain_list and #proxy_domain_list > 0 then
+            push(config.dns.rules, { rule_set = "proxy-domain", action = "route", server = "main-dns" })
+        end
+        push(config.dns.rules, { rule_set = "geosite-cn", action = "route", server = "china-dns" })
+        push(config.dns.rules, {
+            type = "logical", mode = "and",
+            rules = { { rule_set = "geosite-noncn", invert = true }, { rule_set = "geoip-cn" } },
+            action = "route", server = "china-dns",
+        })
+    end
+elseif not isEmpty(default_outbound) then
+    uci:foreach(UCICONFIG, UCIDNSSERVER, function(cfg)
+        if cfg.enabled ~= "1" then return end
+        local outbound = get_outbound(cfg.outbound)
+        if outbound == "direct-out" and isEmpty(self_mark) then outbound = nil end
+        push(config.dns.servers, {
+            tag = "cfg-" .. cfg[".name"] .. "-dns",
+            type = cfg.type, server = cfg.server, server_port = strToInt(cfg.server_port),
+            path = cfg.path, headers = cfg.headers,
+            tls = cfg.tls_sni and { enabled = true, server_name = cfg.tls_sni } or nil,
+            domain_resolver = (cfg.address_resolver or cfg.address_strategy) and {
+                server = get_resolver(cfg.address_resolver or dns_default_server),
+                strategy = cfg.address_strategy,
+            } or nil,
+            detour = outbound,
+        })
+    end)
+    uci:foreach(UCICONFIG, UCIDNSRULE, function(cfg)
+        if cfg.enabled ~= "1" then return end
+        push(config.dns.rules, {
+            ip_version = strToInt(cfg.ip_version), query_type = parse_dnsquery(cfg.query_type),
+            network = cfg.network, protocol = cfg.protocol,
+            domain = cfg.domain, domain_suffix = cfg.domain_suffix,
+            domain_keyword = cfg.domain_keyword, domain_regex = cfg.domain_regex,
+            port = parse_port(cfg.port), port_range = cfg.port_range,
+            source_ip_cidr = cfg.source_ip_cidr, source_ip_is_private = strToBool(cfg.source_ip_is_private),
+            ip_cidr = cfg.ip_cidr, ip_is_private = strToBool(cfg.ip_is_private),
+            source_port = parse_port(cfg.source_port), source_port_range = cfg.source_port_range,
+            process_name = cfg.process_name, process_path = cfg.process_path,
+            process_path_regex = cfg.process_path_regex, user = cfg.user,
+            rule_set = get_ruleset(cfg.rule_set),
+            rule_set_ip_cidr_match_source = strToBool(cfg.rule_set_ip_cidr_match_source),
+            rule_set_ip_cidr_accept_empty = strToBool(cfg.rule_set_ip_cidr_accept_empty),
+            invert = strToBool(cfg.invert), outbound = get_outbound(cfg.outbound),
+            action = cfg.action, server = get_resolver(cfg.server), strategy = cfg.domain_strategy,
+            disable_cache = strToBool(cfg.dns_disable_cache), rewrite_ttl = strToInt(cfg.rewrite_ttl),
+            client_subnet = cfg.client_subnet, method = cfg.reject_method,
+            no_drop = strToBool(cfg.reject_no_drop), rcode = cfg.predefined_rcode,
+            answer = cfg.predefined_answer, ns = cfg.predefined_ns, extra = cfg.predefined_extra,
+        })
+    end)
+    config.dns.final = get_resolver(dns_default_server)
+end
+
+-- Inbounds
+config.inbounds = {
+    { type = "direct", tag = "dns-in", listen = "::", listen_port = tonumber(dns_port) },
+    { type = "mixed", tag = "mixed-in", listen = "::", listen_port = tonumber(mixed_port),
+      udp_timeout = strToTime(udp_timeout), set_system_proxy = false },
+}
+if proxy_mode:find("redirect") then
+    push(config.inbounds, { type = "redirect", tag = "redirect-in", listen = "::",
+        listen_port = tonumber(redirect_port) })
+end
+if tproxy_port then
+    push(config.inbounds, { type = "tproxy", tag = "tproxy-in", listen = "::",
+        listen_port = tonumber(tproxy_port), network = "udp",
+        udp_timeout = strToTime(udp_timeout) })
+end
+if proxy_mode:find("tun") then
+    push(config.inbounds, { type = "tun", tag = "tun-in", interface_name = tun_name,
+        address = (ipv6_support == "1") and { tun_addr4, tun_addr6 } or { tun_addr4 },
+        mtu = strToInt(tun_mtu), auto_route = false,
+        endpoint_independent_nat = strToBool(endpoint_independent_nat),
+        udp_timeout = strToTime(udp_timeout), stack = tcpip_stack })
+end
+
+-- Outbounds
+config.endpoints = {}
+config.outbounds = {
+    { type = "direct", tag = "direct-out", routing_mark = strToInt(self_mark) },
+    { type = "block", tag = "block-out" },
+}
+local function add_endpoint(node_cfg, tag)
+    local ep = generate_endpoint(node_cfg)
+    if ep and tag then ep.tag = tag end
+    if ep then push(config.endpoints, ep) end
+end
+local function add_outbound(node_cfg, tag)
+    local ob = generate_outbound(node_cfg)
+    if ob and tag then ob.tag = tag end
+    if ob then push(config.outbounds, ob) end
+end
+
+if not isEmpty(main_node) then
+    local urltest_nodes = {}
+    if main_node == "urltest" then
+        local nodes = uget(UCIMAIN, "main_urltest_nodes") or {}
+        local interval = uget(UCIMAIN, "main_urltest_interval")
+        local interval_n = strToInt(interval)
+        push(config.outbounds, {
+            type = "urltest", tag = "main-out",
+            outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
+            interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_urltest_tolerance")),
+            idle_timeout = (interval_n and interval_n > 1800)
+                and (interval_n * 2 .. "s") or nil,
+        })
+        urltest_nodes = nodes
+    else
+        local ncfg = uci:get_all(UCICONFIG, main_node) or {}
+        if ncfg.type == "wireguard" then add_endpoint(ncfg, "main-out")
+        else add_outbound(ncfg, "main-out") end
+    end
+
+    if main_udp_node == "urltest" then
+        local nodes = uget(UCIMAIN, "main_udp_urltest_nodes") or {}
+        local interval = uget(UCIMAIN, "main_udp_urltest_interval")
+        local interval_n = strToInt(interval)
+        push(config.outbounds, {
+            type = "urltest", tag = "main-udp-out",
+            outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
+            interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_udp_urltest_tolerance")),
+            idle_timeout = (interval_n and interval_n > 1800)
+                and (interval_n * 2 .. "s") or nil,
+        })
+        for _, l in ipairs(filter(nodes, function(l) return not contains(urltest_nodes, l) end)) do
+            urltest_nodes[#urltest_nodes + 1] = l
+        end
+    elseif dedicated_udp_node then
+        local ncfg = uci:get_all(UCICONFIG, main_udp_node) or {}
+        if ncfg.type == "wireguard" then add_endpoint(ncfg, "main-udp-out")
+        else add_outbound(ncfg, "main-udp-out") end
+    end
+
+    for _, i in ipairs(urltest_nodes) do
+        local ncfg = uci:get_all(UCICONFIG, i) or {}
+        if ncfg.type == "wireguard" then add_endpoint(ncfg, "cfg-" .. i .. "-out")
+        else add_outbound(ncfg, "cfg-" .. i .. "-out") end
+    end
+elseif not isEmpty(default_outbound) then
+    local urltest_nodes, routing_nodes = {}, {}
+    uci:foreach(UCICONFIG, UCIROUTINGNODE, function(cfg)
+        if cfg.enabled ~= "1" then return end
+        if cfg.node == "urltest" then
+            push(config.outbounds, {
+                type = "urltest", tag = "cfg-" .. cfg[".name"] .. "-out",
+                outbounds = map(cfg.urltest_nodes, function(k) return "cfg-" .. k .. "-out" end),
+                url = cfg.urltest_url, interval = strToTime(cfg.urltest_interval),
+                tolerance = strToInt(cfg.urltest_tolerance),
+                idle_timeout = strToTime(cfg.urltest_idle_timeout),
+                interrupt_exist_connections = strToBool(cfg.urltest_interrupt_exist_connections),
+            })
+            for _, l in ipairs(filter(cfg.urltest_nodes, function(l) return not contains(urltest_nodes, l) end)) do
+                urltest_nodes[#urltest_nodes + 1] = l
+            end
+        else
+            local ob = uci:get_all(UCICONFIG, cfg.node) or {}
+            if ob.type == "wireguard" then
+                add_endpoint(ob)
+                local last = config.endpoints[#config.endpoints]
+                last.bind_interface = cfg.bind_interface
+                last.detour = get_outbound(cfg.outbound)
+                if cfg.domain_resolver then
+                    last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
+                end
+            else
+                add_outbound(ob)
+                local last = config.outbounds[#config.outbounds]
+                last.bind_interface = cfg.bind_interface
+                last.detour = get_outbound(cfg.outbound)
+                if cfg.domain_resolver then
+                    last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
+                end
+            end
+            routing_nodes[#routing_nodes + 1] = cfg.node
+        end
+    end)
+    for _, i in ipairs(filter(urltest_nodes, function(l) return not contains(routing_nodes, l) end)) do
+        local ncfg = uci:get_all(UCICONFIG, i) or {}
+        if ncfg.type == "wireguard" then add_endpoint(ncfg) else add_outbound(ncfg) end
+    end
+end
+
+-- Routing rules
+config.route = {
+    rules = { { inbound = "dns-in", action = "hijack-dns" }, { action = "sniff" } },
+    rule_set = {},
+    auto_detect_interface = isEmpty(default_interface) and true or nil,
+    default_interface = default_interface,
+}
+
+if not isEmpty(main_node) then
+    config.route.default_domain_resolver = {
+        action = "route",
+        server = (routing_mode == "bypass_mainland_china") and "china-dns" or "default-dns",
+        strategy = (ipv6_support ~= "1") and "prefer_ipv4" or nil,
+    }
+    if direct_domain_list and #direct_domain_list > 0 then
+        push(config.route.rules, { rule_set = "direct-domain", action = "route", outbound = "direct-out" })
+    end
+    if dedicated_udp_node then
+        push(config.route.rules, { network = "udp", action = "route", outbound = "main-udp-out" })
+    end
+    config.route.final = "main-out"
+
+    if direct_domain_list and #direct_domain_list > 0 then
+        push(config.route.rule_set, { type = "inline", tag = "direct-domain",
+            rules = { { domain_keyword = direct_domain_list } } })
+    end
+    if proxy_domain_list and #proxy_domain_list > 0 then
+        push(config.route.rule_set, { type = "inline", tag = "proxy-domain",
+            rules = { { domain_keyword = proxy_domain_list } } })
+    end
+    if routing_mode == "bypass_mainland_china" then
+        push(config.route.rule_set, { type = "remote", tag = "geoip-cn", format = "binary",
+            url = "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs",
+            download_detour = "main-out" })
+        push(config.route.rule_set, { type = "remote", tag = "geosite-cn", format = "binary",
+            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs",
+            download_detour = "main-out" })
+        push(config.route.rule_set, { type = "remote", tag = "geosite-noncn", format = "binary",
+            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs",
+            download_detour = "main-out" })
+    end
+elseif not isEmpty(default_outbound) then
+    config.route.default_domain_resolver = { action = "resolve", server = get_resolver(default_outbound_dns) }
+    if domain_strategy then
+        push(config.route.rules, { action = "resolve", strategy = domain_strategy })
+    end
+    uci:foreach(UCICONFIG, UCIROUTINGRULE, function(cfg)
+        if cfg.enabled ~= "1" then return end
+        push(config.route.rules, {
+            ip_version = strToInt(cfg.ip_version), protocol = cfg.protocol, network = cfg.network,
+            domain = cfg.domain, domain_suffix = cfg.domain_suffix,
+            domain_keyword = cfg.domain_keyword, domain_regex = cfg.domain_regex,
+            source_ip_cidr = cfg.source_ip_cidr, source_ip_is_private = strToBool(cfg.source_ip_is_private),
+            ip_cidr = cfg.ip_cidr, ip_is_private = strToBool(cfg.ip_is_private),
+            source_port = parse_port(cfg.source_port), source_port_range = cfg.source_port_range,
+            port = parse_port(cfg.port), port_range = cfg.port_range,
+            process_name = cfg.process_name, process_path = cfg.process_path,
+            process_path_regex = cfg.process_path_regex, user = cfg.user,
+            rule_set = get_ruleset(cfg.rule_set),
+            rule_set_ip_cidr_match_source = strToBool(cfg.rule_set_ip_cidr_match_source),
+            invert = strToBool(cfg.invert), action = cfg.action, outbound = get_outbound(cfg.outbound),
+            override_address = cfg.override_address, override_port = strToInt(cfg.override_port),
+            udp_disable_domain_unmapping = strToBool(cfg.udp_disable_domain_unmapping),
+            udp_connect = strToBool(cfg.udp_connect), udp_timeout = strToTime(cfg.udp_timeout),
+            tls_fragment = strToBool(cfg.tls_fragment),
+            tls_fragment_fallback_delay = strToTime(cfg.tls_fragment_fallback_delay),
+            tls_record_fragment = strToBool(cfg.tls_record_fragment),
+        })
+    end)
+    config.route.final = get_outbound(default_outbound)
+    uci:foreach(UCICONFIG, UCIRULESET, function(cfg)
+        if cfg.enabled ~= "1" then return end
+        push(config.route.rule_set, {
+            type = cfg.type, tag = "cfg-" .. cfg[".name"] .. "-rule", format = cfg.format,
+            path = cfg.path, url = cfg.url, download_detour = get_outbound(cfg.outbound),
+            update_interval = cfg.update_interval,
+        })
+    end)
+end
+
+if routing_mode == "bypass_mainland_china" or routing_mode == "custom" then
+    config.experimental = {
+        cache_file = {
+            enabled = true, path = hp.RUN_DIR .. "/cache.db",
+            store_rdrc = strToBool(cache_file_store_rdrc),
+            rdrc_timeout = strToTime(cache_file_rdrc_timeout),
+        },
+    }
+end
+
+hp.mkdir_p(hp.RUN_DIR)
+hp.writefile(hp.RUN_DIR .. "/sing-box-c.json", hp.encode_json(config))
