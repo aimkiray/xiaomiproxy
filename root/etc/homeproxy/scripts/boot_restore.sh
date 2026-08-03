@@ -19,6 +19,8 @@
 # intentional user stop (init scripts still present) is never overridden.
 
 set -u
+# Ensure cron/auto_start (minimal env) can find core utils + flock.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 HP=/data/other_vol/homeproxy
 INITD=/etc/init.d
 RUN=/var/run/homeproxy
