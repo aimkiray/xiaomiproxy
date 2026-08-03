@@ -77,6 +77,8 @@ stop_fw() {
     done
     ipset destroy homeproxy_cn4 2>/dev/null
     ipset destroy homeproxy_cn6 2>/dev/null
+    ipset destroy homeproxy_gfw4 2>/dev/null
+    ipset destroy homeproxy_gfw6 2>/dev/null
 }
 
 [ "$1" = "stop" ] && { stop_fw; exit 0; }
@@ -118,6 +120,28 @@ fi
 cnset4=homeproxy_cn4
 cnset6=homeproxy_cn6
 
+# --- ipsets for gfwlist (dynamic, populated by dnsmasq) -------------------
+if [ "$routing_mode" = "gfwlist" ]; then
+    ipset destroy homeproxy_gfw4 2>/dev/null
+    ipset create homeproxy_gfw4 hash:ip family inet maxelem 65536 2>/dev/null || \
+        echo "homeproxy: WARNING: failed to create homeproxy_gfw4 ipset." >&2
+    if [ "$ipv6" = "1" ]; then
+        ipset destroy homeproxy_gfw6 2>/dev/null
+        ipset create homeproxy_gfw6 hash:ip family inet6 maxelem 65536 2>/dev/null
+    fi
+    [ -s "$RES_DIR/gfw_list.txt" ] || \
+        echo "homeproxy: WARNING: gfw_list.txt missing/empty -- gfwlist will proxy nothing (all direct)." >&2
+fi
+
+# routing-mode ipset: cn set for bypass/proxy_mainland, gfw set for gfwlist.
+route_set4="
+route_set6="
+if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; then
+    route_set4="$cnset4"; route_set6="$cnset6"
+elif [ "$routing_mode" = "gfwlist" ]; then
+    route_set4=homeproxy_gfw4; route_set6=homeproxy_gfw6
+fi
+
 # --- skip rules shared by v4/v6 (nat and mangle) --------------------------
 # $1=iptables cmd  $2=table(nat|mangle)  $3=chain
 emit_skip() {
@@ -145,14 +169,16 @@ emit_skip() {
 }
 
 # routing-mode rule(s): which destinations are direct (RETURN) before proxy
-# $1=iptables  $2=table  $3=chain  $4=cnset (empty if none)
+# $1=iptables  $2=table  $3=chain  $4=rset (empty if none)
 emit_routing() {
-    local ip="$1" tbl="$2" ch="$3" cnset="$4"
+    local ip="$1" tbl="$2" ch="$3" rset="$4"
     case "$routing_mode" in
         bypass_mainland_china)
-            [ -n "$cnset" ] && $ip -t "$tbl" -A "$ch" -m set --match-set "$cnset" dst -j RETURN ;;
+            [ -n "$rset" ] && $ip -t "$tbl" -A "$ch" -m set --match-set "$rset" dst -j RETURN ;;
         proxy_mainland_china)
-            [ -n "$cnset" ] && $ip -t "$tbl" -A "$ch" -m set ! --match-set "$cnset" dst -j RETURN ;;
+            [ -n "$rset" ] && $ip -t "$tbl" -A "$ch" -m set ! --match-set "$rset" dst -j RETURN ;;
+        gfwlist)
+            [ -n "$rset" ] && $ip -t "$tbl" -A "$ch" -m set ! --match-set "$rset" dst -j RETURN ;;
     esac
 }
 
@@ -180,12 +206,12 @@ emit_control() {
 
 # --- TCP redirect (nat) ---------------------------------------------------
 apply_tcp() {
-    local ip="$1" cnset="$2"
+    local ip="$1" rset="$2"
     $ip -t nat -N homeproxy_redir 2>/dev/null || $ip -t nat -F homeproxy_redir
     $ip -t nat -D PREROUTING $IFARG -p tcp -j homeproxy_redir 2>/dev/null
     $ip -t nat -A PREROUTING $IFARG -p tcp -j homeproxy_redir
     emit_skip "$ip" nat homeproxy_redir
-    emit_routing "$ip" nat homeproxy_redir "$cnset"
+    emit_routing "$ip" nat homeproxy_redir "$rset"
     # mirror upstream: only redirect common ports when routing_port=common.
     local tcp_act="-p tcp -j REDIRECT --to-ports $redirect_port"
     if [ "$routing_port" = "common" ]; then
@@ -196,12 +222,12 @@ apply_tcp() {
 
 # --- UDP tproxy (mangle) --------------------------------------------------
 apply_udp() {
-    local ip="$1" cnset="$2"
+    local ip="$1" rset="$2"
     $ip -t mangle -N homeproxy_mangle 2>/dev/null || $ip -t mangle -F homeproxy_mangle
     $ip -t mangle -D PREROUTING $IFARG -p udp -j homeproxy_mangle 2>/dev/null
     $ip -t mangle -A PREROUTING $IFARG -p udp -j homeproxy_mangle
     emit_skip "$ip" mangle homeproxy_mangle
-    emit_routing "$ip" mangle homeproxy_mangle "$cnset"
+    emit_routing "$ip" mangle homeproxy_mangle "$rset"
     # leave DNS to the nat-table hijack (homeproxy_dns), not TPROXY
     $ip -t mangle -A homeproxy_mangle -p udp --dport 53 -j RETURN
     # do not proxy QUIC over UDP (let clients fall back to TCP)
@@ -215,12 +241,12 @@ apply_udp() {
 
 # --- DNS hijack (nat) -----------------------------------------------------
 apply_dns() {
-    local ip="$1"
+    local ip="$1" target="$2"
     $ip -t nat -N homeproxy_dns 2>/dev/null || $ip -t nat -F homeproxy_dns
     $ip -t nat -D PREROUTING $IFARG -p udp --dport 53 -j homeproxy_dns 2>/dev/null
     $ip -t nat -A PREROUTING $IFARG -p udp --dport 53 -j homeproxy_dns
     emit_skip "$ip" nat homeproxy_dns
-    $ip -t nat -A homeproxy_dns -p udp --dport 53 -j REDIRECT --to-ports "$dns_port"
+    $ip -t nat -A homeproxy_dns -p udp --dport 53 -j REDIRECT --to-ports "$target"
 }
 
 # --- apply per family -----------------------------------------------------
@@ -235,21 +261,25 @@ if [ "$main_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
 fi
 
 if echo "$proxy_mode" | grep -q redirect; then
-    apply_tcp "$IP4" "$cnset4"
-    if [ "$ipv6" = "1" ]; then apply_tcp "$IP6" "$cnset6"; fi
+    apply_tcp "$IP4" "$route_set4"
+    if [ "$ipv6" = "1" ]; then apply_tcp "$IP6" "$route_set6"; fi
 fi
 if echo "$proxy_mode" | grep -q tproxy && [ "$udp_tproxy" = "1" ]; then
-    apply_udp "$IP4" "$cnset4"
-    if [ "$ipv6" = "1" ]; then apply_udp "$IP6" "$cnset6"; fi
+    apply_udp "$IP4" "$route_set4"
+    if [ "$ipv6" = "1" ]; then apply_udp "$IP6" "$route_set6"; fi
 fi
 # DNS hijack (UDP/53 only, mirroring upstream). Skipped when the user disables
 # it (infra.dns_redirect=0) or dnsmasq already redirects DNS, to avoid double
 # hijack.
 dns_hijacked=0
 [ "$(uci -q get dhcp.@dnsmasq[0].dns_redirect 2>/dev/null)" = "1" ] && dns_hijacked=1
+dns_target="$dns_port"
+# gfwlist: force DNS to dnsmasq (port 53) so it can forward GFW domains to
+# sing-box and populate the gfw ipset. Other modes: hijack directly to sing-box.
+[ "$routing_mode" = "gfwlist" ] && dns_target=53
 if [ "$dns_redirect" = "1" ] && [ "$dns_hijacked" != "1" ]; then
-    apply_dns "$IP4"
-    [ "$ipv6" = "1" ] && apply_dns "$IP6"
+    apply_dns "$IP4" "$dns_target"
+    [ "$ipv6" = "1" ] && apply_dns "$IP6" "$dns_target"
 else
     echo "homeproxy: DNS hijack skipped (dns_redirect=$dns_redirect dnsmasq_hijacked=$dns_hijacked)." >&2
 fi
