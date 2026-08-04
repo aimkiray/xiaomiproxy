@@ -159,10 +159,10 @@ start_service() {
     # where needed, populates an ipset the firewall matches against. The
     # firewall.sh run above already created those ipsets.
     if [ "$outbound_node" != "nil" ]; then
-        local hp_ipv6 hp_dns_port gfw_v6="" wan_v6=""
+        local hp_ipv6 hp_dns_port gfw_v6="" wan_v6="" wan_direct_v6=""
         config_get_bool hp_ipv6 "config" "ipv6_support" "0"
         config_get hp_dns_port "infra" "dns_port" "5333"
-        [ "$hp_ipv6" = "1" ] && { gfw_v6=",homeproxy_gfw6"; wan_v6=",homeproxy_wan_proxy6"; }
+        [ "$hp_ipv6" = "1" ] && { gfw_v6=",homeproxy_gfw6"; wan_v6=",homeproxy_wan_proxy6"; wan_direct_v6=",homeproxy_wan_direct6"; }
         mkdir -p /tmp/dnsmasq.d
         case "$routing_mode" in
         "bypass_mainland_china"|"custom"|"global")
@@ -193,6 +193,14 @@ start_service() {
             awk -v dp="$hp_dns_port" -v v6="$wan_v6" \
                 'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_wan_proxy4"v6}' \
                 "$HP_DIR/resources/proxy_list.txt" > /tmp/dnsmasq.d/homeproxy_proxy_list.conf
+        fi
+        # direct_list.txt: always-direct domains -> add to wan_direct ipset so the
+        # firewall steers them direct (RETURN) regardless of routing mode. No
+        # server= redirect: let them resolve normally and force-direct by ipset.
+        if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/direct_list.txt" ]; then
+            awk -v v6="$wan_direct_v6" \
+                'NF && !/^#/ {print "ipset=/"$0"/homeproxy_wan_direct4"v6}' \
+                "$HP_DIR/resources/direct_list.txt" > /tmp/dnsmasq.d/homeproxy_direct_list.conf
         fi
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi

@@ -19,6 +19,7 @@ h1{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
 label{color:var(--mut);min-width:96px;font-size:13px}
 select,input{flex:1;background:var(--card2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:8px 10px;font-size:14px;min-width:0}
 select:focus,input:focus{outline:none;border-color:var(--ac)}
+textarea{flex:1;background:var(--card2);color:var(--tx);border:1px solid var(--bd);border-radius:7px;padding:8px 10px;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-width:0;resize:vertical}
 button{background:var(--ac);color:#fff;border:0;border-radius:7px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
 button.ghost{background:var(--card2);color:var(--tx);border:1px solid var(--bd)}
@@ -77,6 +78,21 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
    </select>
    <button id="applyLanProxy" class="ghost">Apply</button>
   </div>
+ </div>
+
+ <div class="card">
+  <h2>Domain lists</h2>
+  <div class="row" style="align-items:flex-start">
+   <label>Direct</label>
+   <textarea id="directList" rows="5" placeholder="one domain per line (e.g. example.com)"></textarea>
+   <button id="applyDirect" class="ghost">Apply</button>
+  </div>
+  <div class="row" style="align-items:flex-start;margin-top:10px">
+   <label>Proxy</label>
+   <textarea id="proxyList" rows="5" placeholder="one domain per line (e.g. google.com)"></textarea>
+   <button id="applyProxy" class="ghost">Apply</button>
+  </div>
+  <div class="sub" style="margin-top:8px">Direct = always bypass proxy · Proxy = always through proxy. Restart regenerates dnsmasq rules.</div>
  </div>
 
  <div class="card">
@@ -147,6 +163,9 @@ async function applyLanProxy(){
  const v=$('lanproxy').value;setBusy('applyLanProxy',true);
  try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
 }
+async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||''}catch(e){toast('domain lists: '+e.message)}}
+async function applyDirectList(){const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
+async function applyProxyList(){const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
 async function doSubscribe(){
  setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
  try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
@@ -163,11 +182,13 @@ function toggleTail(){
  else{tailTimer=setInterval(loadLog,4000);$('btnTail').textContent='Auto-tail: on';loadLog()}
 }
 
-async function refresh(){await loadConfig();await loadLog()}
+async function refresh(){await loadConfig();await loadDomainLists();await loadLog()}
 
 $('applyNode').onclick=applyNode;
 $('applyMode').onclick=applyMode;
 $('applyLanProxy').onclick=applyLanProxy;
+$('applyDirect').onclick=applyDirectList;
+$('applyProxy').onclick=applyProxyList;
 $('btnSub').onclick=doSubscribe;
 $('btnRestart').onclick=doRestart;
 $('btnRefresh').onclick=refresh;

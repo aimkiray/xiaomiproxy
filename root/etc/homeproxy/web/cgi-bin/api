@@ -10,6 +10,9 @@
 #   set_main_node      body=node        -> set + restart
 #   set_routing_mode   body=mode        -> set + restart
 #   set_lan_proxy     body=mode        -> set control.lan_proxy_mode + restart
+#   get_domain_lists                   -> {direct,proxy} domain lists
+#   set_direct_list   body=domains     -> overwrite direct_list.txt + restart
+#   set_proxy_list   body=domains     -> overwrite proxy_list.txt + restart
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
@@ -122,6 +125,29 @@ set_lan_proxy)
 	json_ok '{"ok":true,"lan_proxy_mode":"'"$(jesc "$body")"'"}'
 	;;
 
+get_domain_lists)
+	RES_DIR=/data/other_vol/homeproxy/resources
+	d=$(cat "$RES_DIR/direct_list.txt" 2>/dev/null)
+	x=$(cat "$RES_DIR/proxy_list.txt" 2>/dev/null)
+	hdr 'Content-Type: application/json'
+	printf '{"ok":true,"direct":"%s","proxy":"%s"}\n' "$(jesc "$d")" "$(jesc "$x")"
+	;;
+
+set_direct_list|set_proxy_list)
+	case "$Q_action" in
+		set_direct_list) file=direct_list.txt ;;
+		set_proxy_list)  file=proxy_list.txt ;;
+	esac
+	RES_DIR=/data/other_vol/homeproxy/resources
+	mkdir -p "$RES_DIR" 2>/dev/null
+	n="${CONTENT_LENGTH:-0}"
+	case "$n" in *[!0-9]*) n=0 ;; esac
+	# write the raw body (CRLF -> LF); empty body clears the list
+	dd bs=1 count="$n" 2>/dev/null | tr -d '\r' > "$RES_DIR/$file" 2>/dev/null || true
+	do_restart
+	json_ok '{"ok":true,"file":"'"$file"'"}'
+	;;
+
 subscribe)
 	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
 	if lua /data/other_vol/homeproxy/lib/update_subscriptions.lua >"$tmp" 2>&1; then
@@ -149,7 +175,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list subscribe restart log"
 	;;
 
 *)
