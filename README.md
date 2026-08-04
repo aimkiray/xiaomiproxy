@@ -6,7 +6,7 @@ A [sing-box](https://github.com/SagerNet/sing-box) front-end for routers **witho
 - **iptables + ipset** traffic steering — TCP redirect, UDP tproxy, DNS hijack, CN bypass.
 - **Shell CLI** (`homeproxy …`) **and a tiny web UI** (status / node / mode / subscribe / restart / log, domain lists, node ping, connectivity) served by a standalone uhttpd on the LAN interface, no auth.
 
-Verified on a Xiaomi router with `sing-box 1.14.0-beta.4`-compatible config (tested against **1.13.15**), `iptables`/`ip6tables`, `ipset`, `xt_TPROXY`.
+Verified on a Xiaomi router with **sing-box 1.13.15** (1.14.x not tested), `iptables`/`ip6tables`, `ipset`, `xt_TPROXY`.
 
 ## Features
 
