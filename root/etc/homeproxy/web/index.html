@@ -168,7 +168,7 @@ async function loadConfig(){
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
-function setBusy(id,on){busy[id]=on;const btn=$(id);if(btn){btn.disabled=on;const o=btn.innerHTML;if(on&&o.indexOf('spin')<0)btn.dataset.h=o,btn.innerHTML='<span class="spin"></span>';else if(!on&&btn.dataset.h)btn.innerHTML=btn.dataset.h}}
+function setBusy(id,on){busy[id]=on;const btn=$(id);if(!btn)return;btn.disabled=on;if(on){if(btn.innerHTML.indexOf('spin')<0){btn.dataset.h=btn.innerHTML;btn.style.width=btn.offsetWidth+'px';btn.innerHTML='<span class="spin"></span>'}}else if(btn.dataset.h){btn.innerHTML=btn.dataset.h;btn.style.width='';delete btn.dataset.h}}
 
 function setNodeMs(results){
  $('node').querySelectorAll('option').forEach(o=>{
