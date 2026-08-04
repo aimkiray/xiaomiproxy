@@ -1,0 +1,73 @@
+# homeproxy — MiWiFi / iptables port
+
+A [sing-box](https://github.com/SagerNet/sing-box) front-end for routers **without LuCI, ucode, or nftables** — e.g. stock Xiaomi/MiWiFi (OpenWrt 18.06 base, kernel 5.4, busybox/ash). The original `luci-app-homeproxy` (LuCI JS view + ucode + fw4/nftables) is replaced by:
+
+- **Lua backend** — on-device `lua 5.1` + `luci.json` + `uci` binding (no `ucode`/`nft`/`fw4`/`jq`).
+- **iptables + ipset** traffic steering — TCP redirect, UDP tproxy, DNS hijack, CN bypass.
+- **Shell CLI** (`homeproxy …`) **and a tiny web UI** (status / node / mode / subscribe / restart / log, domain lists, node ping, connectivity) served by a standalone uhttpd on the LAN interface, no auth.
+
+Verified on a Xiaomi router with `sing-box 1.14.0-beta.4`-compatible config (tested against **1.13.15**), `iptables`/`ip6tables`, `ipset`, `xt_TPROXY`.
+
+## Features
+
+- Routing modes: `bypass_mainland_china`, `global`, `gfwlist`, `proxy_mainland_china`, `custom`.
+- Proxy modes: `redirect_tproxy` (TCP redirect + UDP tproxy + DNS hijack), `tun` (best-effort).
+- Subscriptions: `ss`/`vmess`/`vless`/`trojan`/`hysteria2`/`http`/`socks`/`tuic`/`anytls` share-links + SIP008.
+- LAN proxy control: `global` / `listed_only` / `except_listed` (per-IP/MAC lists).
+- Force-direct / force-proxy **domain lists** (fed to both dnsmasq `ipset=`/`server=` and sing-box inline rule-sets).
+- Node TCP/HTTP delay (ms) via the sing-box Clash API; Google/Baidu connectivity test.
+- Auto-update subscriptions/resources via cron; boot-time self-restore on MiWiFi's volatile `/etc`.
+
+## Requirements
+
+sing-box (not bundled) + `lua 5.1`, `luci.json`, `uci` binding, `iptables`/`ip6tables`, `ipset`, `kmod-ipt-tproxy`, `kmod-ipt-ipset`. **No** `ucode`, `nft`, `fw4`, or `jq` needed.
+
+## Install (on the router)
+
+```sh
+# one-shot installer / upgrader (also bundles sing-box 1.13.15 arm64 by default)
+curl -fsSL <URL>/install.sh | sh
+# or from a local checkout / tarball:
+sh install.sh [SRC] [--force] [--rollback]
+# env: HP_SRC_URL (tarball URL)  HP_SINGBOX_URL  HP_CONFIRM_TIMEOUT (default 30)
+```
+
+Persistent files live on `/data/other_vol/homeproxy` (ubifs); volatile `/etc` bits are recreated every boot by `boot_restore.sh`. A failed **upgrade** auto-rolls back after a 30s verify window; a failed **fresh** install cleans up to a safe no-proxy state. Paths are resolved via `/etc/homeproxy/env.sh` (sourced by init.d / CLI / cron / firewall / web API).
+
+## Quick start (CLI)
+
+```sh
+homeproxy subscribe                 # fetch/parse subscription -> nodes
+homeproxy nodes                     # list node sections (hash + label)
+homeproxy main-node <hash>          # pick the main outbound
+homeproxy routing-mode bypass_mainland_china
+homeproxy proxy-mode redirect_tproxy
+homeproxy lan-proxy global          # global | listed_only | except_listed
+homeproxy generate && homeproxy restart
+homeproxy log -f
+```
+
+## Quick start (web UI)
+
+Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dropdown + Apply, routing/LAN-proxy selects, direct/proxy domain lists, node ping, Google/Baidu connectivity, subscription update, restart, live log.
+
+## Project layout
+
+- `Makefile` — OpenWrt package definition (`Package/homeproxy`).
+- `root/usr/lib/homeproxy/` — Lua backend (`homeproxy.lua`, `generate_client.lua`, `generate_server.lua`, `migrate_config.lua`, `update_subscriptions.lua`, `firewall.sh`).
+- `root/usr/bin/homeproxy` — CLI.
+- `root/etc/init.d/homeproxy` — procd service + dnsmasq steering + firewall.
+- `root/etc/homeproxy/web/` — web UI (`index.html` + `cgi-bin/api`).
+- `root/etc/homeproxy/resources/` — geodata/lists (`china_ip4/6.txt`, `china_list.txt`, `gfw_list.txt`, `direct_list.txt`, `proxy_list.txt`).
+- `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh`, `boot_restore.sh`.
+- `install.sh` — on-router installer/upgrader.
+
+## Notes / limitations
+
+- `/` is squashfs (read-only) on MiWiFi; the installer places everything on `/data/other_vol` and symlinks `/etc/homeproxy` → it.
+- Only `redirect_tproxy` (+ DNS hijack) is fully wired for iptables; `tun` needs the tun kmod and is best-effort.
+- Port-forward / DNAT rules from the stock firewall (`fw3`) are never touched — only homeproxy's own chains/ipsets are managed.
+
+## License
+
+GPL-2.0-only (SPDX headers in every file). Upstream: [`immortalwrt/homeproxy`](https://github.com/immortalwrt/homeproxy).
