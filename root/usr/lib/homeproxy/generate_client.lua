@@ -697,13 +697,37 @@ elseif not isEmpty(default_outbound) then
     end)
 end
 
+-- Materialize an outbound for EVERY node (cfg-<sect>-out) so the Clash API
+-- can run a per-node reachability/delay test from the web UI. Outbounds not
+-- referenced by any route are inert (no routing/port-forward impact). The
+-- active node keeps its "main-out" alias; this adds the cfg-<sect>-out form
+-- the UI keys on. Gated by HP_MATERIALIZE_ALL_NODES (default on; init.d
+-- retries with =0 if a bad unused node fails sing-box check, so a malformed
+-- node never blocks startup -- ping-all is just unavailable for that run).
+if os.getenv("HP_MATERIALIZE_ALL_NODES") ~= "0" then
+    local function has_outbound(tag)
+        for _, o in ipairs(config.outbounds) do if o.tag == tag then return true end end
+        for _, e in ipairs(config.endpoints) do if e.tag == tag then return true end end
+        return false
+    end
+    uci:foreach(UCICONFIG, UCINODE, function(cfg)
+        local tag = "cfg-" .. cfg[".name"] .. "-out"
+        if has_outbound(tag) then return end
+        if cfg.type == "wireguard" then add_endpoint(cfg, tag)
+        else add_outbound(cfg, tag) end
+    end)
+end
+
+-- Clash API (loopback only, no secret) so the web UI can run per-node
+-- delay tests via GET /proxies/<tag>/delay. Used by the ping_nodes endpoint.
+config.experimental = {
+    clash_api = { external_controller = "127.0.0.1:19290" },
+}
 if routing_mode == "bypass_mainland_china" or routing_mode == "custom" then
-    config.experimental = {
-        cache_file = {
-            enabled = true, path = hp.RUN_DIR .. "/cache.db",
-            store_rdrc = strToBool(cache_file_store_rdrc),
-            rdrc_timeout = strToTime(cache_file_rdrc_timeout),
-        },
+    config.experimental.cache_file = {
+        enabled = true, path = hp.RUN_DIR .. "/cache.db",
+        store_rdrc = strToBool(cache_file_store_rdrc),
+        rdrc_timeout = strToTime(cache_file_rdrc_timeout),
     }
 end
 

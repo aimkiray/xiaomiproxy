@@ -46,9 +46,16 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
  </div>
 
  <div class="card">
+  <h2>Connectivity <button id="btnConn" class="ghost" style="float:right;padding:2px 10px;font-size:12px">Test</button></h2>
+  <div class="kv"><span>Google (overseas)</span><span id="connGoogle">—</span></div>
+  <div class="kv"><span>Baidu (CN)</span><span id="connBaidu">—</span></div>
+ </div>
+
+ <div class="card">
   <h2>Main node</h2>
   <div class="row">
    <select id="node"></select>
+   <button id="btnPing" class="ghost">Ping</button>
    <button id="applyNode" class="ghost">Apply</button>
   </div>
  </div>
@@ -119,7 +126,7 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
 <script>
 const API='/cgi-bin/api';
 const $=id=>document.getElementById(id);
-let cfg=null,tailTimer=null,busy={};
+let cfg=null,tailTimer=null,busy={},pingResults=null;
 
 function toast(msg,ms=2600){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms)}
 async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});return r.text()}
@@ -142,6 +149,7 @@ async function loadState(){
    sel.innerHTML='<option value="nil">— none (nil) —</option>'+nodes.map(([k,v])=>`<option value="${k}"${k===cur?' selected':''}>${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
    if(cur==='urltest')sel.innerHTML='<option value="urltest" selected>urltest (auto)</option>'+sel.innerHTML;
    else if(!nodes.some(([k])=>k===cur)&&cur!=='nil')sel.value=cur;
+   if(pingResults)setNodeMs(pingResults);
   }
  }catch(e){toast('state: '+e.message)}
 }
@@ -150,6 +158,33 @@ async function loadConfig(){try{const t=await api('config');cfg=JSON.parse(t);lo
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
 function setBusy(id,on){busy[id]=on;const btn=$(id);if(btn){btn.disabled=on;const o=btn.innerHTML;if(on&&o.indexOf('spin')<0)btn.dataset.h=o,btn.innerHTML='<span class="spin"></span>';else if(!on&&btn.dataset.h)btn.innerHTML=btn.dataset.h}}
+
+function setNodeMs(results){
+ $('node').querySelectorAll('option').forEach(o=>{
+  let t=o.textContent.replace(/\s*\u00b7\s*(\d+ms|timeout|\u2013)$/,'');
+  const id=o.value;
+  if(id==='nil'||id==='urltest'){o.textContent=t;return}
+  const m=results&&results[id];
+  const suffix=(m===null)?' \u00b7 timeout':((typeof m==='number'&&m>=0)?(' \u00b7 '+m+'ms'):' \u00b7 \u2013');
+  o.textContent=t+suffix;
+ });
+}
+async function pingNodes(){
+ setBusy('btnPing',true);
+ try{const r=await apiJson('ping_nodes');if(r.ok&&r.results){pingResults=r.results;setNodeMs(r.results)}else toast('ping failed: '+(r.error||''))}catch(e){toast('ping failed: '+e.message)}finally{setBusy('btnPing',false)}
+}
+
+function renderConn(el,r){
+ if(!r){el.textContent='—';el.style.color='';return}
+ const ms=(r.ms!=null)?r.ms+'ms':'–';
+ el.textContent=(r.ok?'✓ ':'✗ ')+ms+(r.code&&r.code!=='000'?(' ('+r.code+')'):'');
+ el.style.color=r.ok?'var(--ok)':'var(--bad)';
+}
+async function testConn(){
+ setBusy('btnConn',true);
+ try{const r=await apiJson('connectivity');if(r.ok){renderConn($('connGoogle'),r.google);renderConn($('connBaidu'),r.baidu)}else toast('connectivity failed: '+(r.error||''))}
+ catch(e){toast('connectivity failed: '+e.message)}finally{setBusy('btnConn',false)}
+}
 
 async function applyNode(){
  const v=$('node').value;setBusy('applyNode',true);
@@ -184,6 +219,8 @@ function toggleTail(){
 
 async function refresh(){await loadConfig();await loadDomainLists();await loadLog()}
 
+$('btnPing').onclick=pingNodes;
+$('btnConn').onclick=testConn;
 $('applyNode').onclick=applyNode;
 $('applyMode').onclick=applyMode;
 $('applyLanProxy').onclick=applyLanProxy;

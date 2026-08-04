@@ -16,15 +16,22 @@
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
+#   ping_nodes         -> per-node TCP/HTTP delay (ms) via sing-box Clash API
+#   connectivity        -> Google (overseas, via proxy) + Baidu (CN) reachability & ms
 
 set -u
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/data/other_vol/bin:/data/other_vol/homeproxy/bin
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
+HP_LIB_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
+HP_RES_DIR="${HP_RES_DIR:-/etc/homeproxy/resources}"
+HP_BIN_DIR="${HP_BIN_DIR:-/usr/bin}"
+HP_SINGBOX="${HP_SINGBOX:-$(command -v sing-box 2>/dev/null)}"
+HP_SINGBOX="${HP_SINGBOX:-/usr/bin/sing-box}"
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:"${HP_SINGBOX%/*}":"$HP_BIN_DIR"
 CONF=homeproxy
 RUN_DIR=/var/run/homeproxy
 LOG_PATH=$RUN_DIR/$CONF.log
 INIT=/etc/init.d/$CONF
-SINGBOX="${HP_SINGBOX:-$(command -v sing-box 2>/dev/null)}"
-[ -n "$SINGBOX" ] || SINGBOX=/data/other_vol/bin/sing-box
+SINGBOX="$HP_SINGBOX"
 
 # --- helpers ---------------------------------------------------------------
 hdr() { printf '%s\r\n\r\n' "$1"; }
@@ -63,6 +70,13 @@ valid_mode() {
 
 # restart the PROXY only (the web UI init is separate, so this never kills uhttpd)
 do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1; }
+
+# Write endpoints require POST -- this is an unauthenticated LAN API, so
+# guard against an accidental GET clearing a list or triggering a restart.
+case "$Q_action" in
+	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|subscribe|restart)
+		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})" ;;
+esac
 
 # --- endpoints -------------------------------------------------------------
 case "$Q_action" in
@@ -126,7 +140,7 @@ set_lan_proxy)
 	;;
 
 get_domain_lists)
-	RES_DIR=/data/other_vol/homeproxy/resources
+	RES_DIR="$HP_RES_DIR"
 	d=$(cat "$RES_DIR/direct_list.txt" 2>/dev/null)
 	x=$(cat "$RES_DIR/proxy_list.txt" 2>/dev/null)
 	hdr 'Content-Type: application/json'
@@ -138,7 +152,7 @@ set_direct_list|set_proxy_list)
 		set_direct_list) file=direct_list.txt ;;
 		set_proxy_list)  file=proxy_list.txt ;;
 	esac
-	RES_DIR=/data/other_vol/homeproxy/resources
+	RES_DIR="$HP_RES_DIR"
 	mkdir -p "$RES_DIR" 2>/dev/null
 	n="${CONTENT_LENGTH:-0}"
 	case "$n" in *[!0-9]*) n=0 ;; esac
@@ -148,9 +162,71 @@ set_direct_list|set_proxy_list)
 	json_ok '{"ok":true,"file":"'"$file"'"}'
 	;;
 
+ping_nodes)
+	# Per-node delay (ms) via the sing-box Clash API (loopback 127.0.0.1:19290).
+	# Requires generate_client.lua experimental.clash_api + a restart. Tests a
+	# real HTTP round-trip through each node outbound -- not a raw TCP ping --
+	# because the router's own OUTPUT is NAT-redirected into sing-box.
+	api=http://127.0.0.1:19290
+	curl -sf --max-time 2 "$api/version" >/dev/null 2>&1 || json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)"
+	test_url=http://www.gstatic.com/generate_204
+	tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/hp_ping.$$ ; mkdir -p "$tmp" 2>/dev/null
+	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
+		tag=cfg-$sect-out
+		( curl -s --max-time 8 "$api/proxies/$tag/delay?url=$test_url&timeout=5000" -o "$tmp/$sect" 2>/dev/null; echo $? >"$tmp/$sect.rc" ) &
+	done
+	wait
+	first=1
+	hdr 'Content-Type: application/json'
+	printf '{"ok":true,"results":{'
+	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
+		[ "$first" -eq 0 ] && printf ','
+		first=0
+		d=$(cat "$tmp/$sect" 2>/dev/null)
+		ms=$(printf '%s' "$d" 2>/dev/null | sed -n 's/.*"delay":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+		[ -n "$ms" ] || ms=null
+		printf '"%s":%s' "$sect" "$ms"
+	done
+	printf '}}\n'
+	rm -rf "$tmp" 2>/dev/null
+	;;
+
+connectivity)
+	# Reachability + round-trip latency for an overseas site (Google) and a CN
+	# site (Baidu). The router's own OUTPUT is NAT-redirected for non-CN dst,
+	# so Google is exercised THROUGH sing-box while Baidu (CN ipset RETURN) goes
+	# direct in bypass mode -- no firewall changes needed. Uses time to first
+	# byte (starttransfer) so Baidu's body size does not skew the latency.
+	tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/hp_conn.$$ ; mkdir -p "$tmp" 2>/dev/null
+	( curl -s -o /dev/null --max-time 8 -w '%{http_code} %{time_starttransfer}' "http://www.google.com/generate_204" >"$tmp/google" 2>/dev/null; echo $? >"$tmp/google.rc" ) &
+	( curl -s -o /dev/null --max-time 8 -w '%{http_code} %{time_starttransfer}' "http://www.baidu.com/" >"$tmp/baidu" 2>/dev/null; echo $? >"$tmp/baidu.rc" ) &
+	wait
+	conn_ms() {
+		# $1=file -> print "<true|false> <code> <ms|null>"
+		local raw code t ok ms
+		raw=$(cat "$tmp/$1" 2>/dev/null)
+		code=$(printf '%s' "$raw" | awk '{print $1}')
+		t=$(printf '%s' "$raw" | awk '{print $2}')
+		ok=false
+		case "$code" in [23]??) ok=true ;; esac
+		if [ "$ok" = "true" ] && [ -n "$t" ]; then
+			ms=$(awk -v x="$t" 'BEGIN{printf "%d",(x+0)*1000}')
+		else
+			ms=null
+		fi
+		printf '%s %s %s' "$ok" "${code:-000}" "$ms"
+	}
+	set -- $(conn_ms google); g_ok=$1; g_code=$2; g_ms=$3
+	set -- $(conn_ms baidu);  b_ok=$1; b_code=$2; b_ms=$3
+	hdr 'Content-Type: application/json'
+	printf '{"ok":true,"google":{"ok":%s,"code":"%s","ms":%s},"baidu":{"ok":%s,"code":"%s","ms":%s}}\n' \
+		"$g_ok" "$g_code" "$g_ms" "$b_ok" "$b_code" "$b_ms"
+	rm -rf "$tmp" 2>/dev/null
+	;;
+
 subscribe)
 	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
-	if lua /data/other_vol/homeproxy/lib/update_subscriptions.lua >"$tmp" 2>&1; then
+	if HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/update_subscriptions.lua" >"$tmp" 2>&1; then
 		uci commit $CONF 2>/dev/null
 		do_restart
 		tail -n 20 "$tmp" 2>/dev/null > "$tmp.short"
@@ -175,7 +251,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list ping_nodes connectivity subscribe restart log"
 	;;
 
 *)
