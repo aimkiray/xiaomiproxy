@@ -11,7 +11,9 @@ STOP=10
 
 CONF="homeproxy"
 HP_DIR="/etc/homeproxy"
-HP_LUA_DIR="/usr/lib/homeproxy"
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
+HP_LUA_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
+export HP_LUAPATH="$HP_LUA_DIR"
 RUN_DIR="/var/run/homeproxy"
 LOG_PATH="$RUN_DIR/homeproxy.log"
 
@@ -54,8 +56,17 @@ start_service() {
             log "Error: failed to generate client configuration."
             return 1
         elif ! "$PROG" check --config "$RUN_DIR/sing-box-c.json" 2>>"$LOG_PATH"; then
-            log "Error: wrong client configuration detected."
-            return 1
+            # A bad *unused* node (now materialized as a probe outbound for the
+            # web UI per-node ping) can fail the whole-config check. Retry
+            # without the probe outbounds so a single malformed node never
+            # blocks startup; ping-all is simply unavailable for that run.
+            log "Config check failed; retrying without per-node probe outbounds..."
+            HP_MATERIALIZE_ALL_NODES=0 lua "$HP_LUA_DIR/generate_client.lua" 2>>"$LOG_PATH"
+            if [ ! -e "$RUN_DIR/sing-box-c.json" ] || ! "$PROG" check --config "$RUN_DIR/sing-box-c.json" 2>>"$LOG_PATH"; then
+                log "Error: wrong client configuration detected."
+                return 1
+            fi
+            log "Config OK after disabling per-node probe outbounds (ping-all unavailable this run)."
         fi
 
         # auto subscription update

@@ -17,12 +17,14 @@ Target environment verified on a Xiaomi router (OpenWrt 18.06 base, kernel 5.4, 
 - `root/etc/init.d/homeproxy` — procd service: runs lua generators, sets tproxy routing table, starts sing-box, applies firewall.
 - `root/etc/config/homeproxy` — UCI default config.
 - `root/etc/homeproxy/resources/` — geodata/lists (`china_ip4/6.txt`, `china_list.txt`, `gfw_list.txt`).
-- `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh` (uses `lua+luci.json` instead of `jsonfilter`).
+- `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh` (uses `lua+luci.json` instead of `jsonfilter`); `boot_restore.sh` (post-boot restorer: recreates volatile `/etc` bits on MiWiFi).
+- `root/etc/homeproxy/web/` — standalone uhttpd web UI (`index.html` + `cgi-bin/api`), no auth, LAN-bound `:8910`.
+- `install.sh` — router-side `curl | sh` installer/upgrader (fresh + in-place upgrade with 30s auto-rollback).
 
 ## Build & Run
 
-- Build an ipk/apk: `.github/build-ipk.sh apk|ipk` (no longer needs `htdocs`/`po`/`po2lmo`).
-- Deploy to a MiWiFi device: copy `root/*` to the router (note `/` is read-only on MiWiFi; place scripts/resources on a writable layer such as `/data` or `/etc` ramfs, or rebuild the firmware).
+- Build an ipk/apk: `.github/build-ipk.sh apk|ipk` (no longer needs `htdocs`/`po`/`po2lmo`). A standard OpenWrt package build installs to `/usr/lib/homeproxy` + `/usr/bin/sing-box` — the defaults every script uses.
+- Deploy to a LuCI-less MiWiFi router (one-shot, on-device): `curl -fsSL <URL>/install.sh | sh` (see `install.sh`). It lays files on persistent `/data/other_vol/homeproxy`, symlinks `/etc/homeproxy` → it, generates `env.sh` with the persistent paths, and wires boot-restore + cron. **No deploy-time `sed` patching**: scripts `source /etc/homeproxy/env.sh` (absent on a standard build → `/usr/lib/homeproxy` fallback), so the same source tree works both ways.
 - Validate a generated config on-device: `sing-box check --config /var/run/homeproxy/sing-box-c.json`.
 - Common commands: `homeproxy generate`, `homeproxy subscribe`, `homeproxy nodes`, `homeproxy main-node <name>`, `homeproxy restart`, `homeproxy log -f`.
 

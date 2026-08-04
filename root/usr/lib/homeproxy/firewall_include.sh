@@ -6,4 +6,6 @@
 # while the service is active (flag set by the init script) so a stopped
 # service is not resurrected by a firewall reload.
 [ -f /var/run/homeproxy/firewall.active ] || exit 0
-/usr/lib/homeproxy/firewall.sh start
+HP_LIB_DIR=/usr/lib/homeproxy
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
+"$HP_LIB_DIR/firewall.sh" start
