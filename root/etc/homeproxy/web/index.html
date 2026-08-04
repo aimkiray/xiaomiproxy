@@ -126,7 +126,7 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
 <script>
 const API='/cgi-bin/api';
 const $=id=>document.getElementById(id);
-let cfg=null,tailTimer=null,busy={},pingResults=null;
+let cfg=null,tailTimer=null,busy={},pingResults=null,lastMain=null,lastMode=null,lastLan=null;
 
 function toast(msg,ms=2600){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms)}
 async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});return r.text()}
@@ -141,19 +141,30 @@ async function loadState(){
   $('ver').textContent='sing-box '+s.version+' · MiWiFi Lua port';
   const kv={main_node:s.main_node,routing_mode:s.routing_mode,proxy_mode:s.proxy_mode,lan_proxy_mode:s.lan_proxy_mode};
   $('kv').innerHTML=fmtKV(kv);
-  $('mode').value=s.routing_mode;
-  $('lanproxy').value=s.lan_proxy_mode;
+  if(lastMode===null||$('mode').value===lastMode)$('mode').value=s.routing_mode;
+  lastMode=s.routing_mode;
+  if(lastLan===null||$('lanproxy').value===lastLan)$('lanproxy').value=s.lan_proxy_mode;
+  lastLan=s.lan_proxy_mode;
   if(cfg&&cfg.values){
    const sel=$('node');const cur=s.main_node;
-   const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
-   sel.innerHTML='<option value="nil">— none (nil) —</option>'+nodes.map(([k,v])=>`<option value="${k}"${k===cur?' selected':''}>${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
-   if(cur==='urltest')sel.innerHTML='<option value="urltest" selected>urltest (auto)</option>'+sel.innerHTML;
-   else if(!nodes.some(([k])=>k===cur)&&cur!=='nil')sel.value=cur;
+   if(![...sel.options].some(o=>o.value===cur)&&cur!=='nil')sel.insertAdjacentHTML('beforeend',`<option value="${esc(cur)}">${esc(cur)} (missing)</option>`);
+   if(lastMain===null||sel.value===lastMain)sel.value=cur;
+   lastMain=cur;
    if(pingResults)setNodeMs(pingResults);
   }
  }catch(e){toast('state: '+e.message)}
 }
-async function loadConfig(){try{const t=await api('config');cfg=JSON.parse(t);loadState()}catch(e){toast('config: '+e.message)}}
+async function loadConfig(){
+ try{
+  const t=await api('config');cfg=JSON.parse(t);
+  const sel=$('node');
+  const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
+  sel.innerHTML='<option value="nil">— none (nil) —</option><option value="urltest">urltest (auto)</option>'+nodes.map(([k,v])=>`<option value="${k}">${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
+  if(lastMain!==null&&[...sel.options].some(o=>o.value===lastMain))sel.value=lastMain;
+  if(pingResults)setNodeMs(pingResults);
+ }catch(e){toast('config: '+e.message)}
+ await loadState();
+}
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
