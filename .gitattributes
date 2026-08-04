@@ -1,0 +1,23 @@
+# Default: text with LF in the repo, auto-convert on checkout per platform.
+* text=auto eol=lf
+
+# These run on busybox/ash on the router -- CRLF breaks them; force LF always.
+*.sh   text eol=lf
+*.lua  text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.py   text eol=lf
+
+# Init scripts and the CLI/api have no extension -- pin LF.
+homeproxy       text eol=lf
+homeproxy-web   text eol=lf
+api             text eol=lf
+install.sh      text eol=lf
+env.sh          text eol=lf
+
+# Binary / generated assets stay untouched.
+*.ipk  binary
+*.apk  binary
+*.tar.gz binary
+*.png  binary
+*.ver  text eol=lf
