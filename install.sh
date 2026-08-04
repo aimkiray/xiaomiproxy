@@ -212,7 +212,7 @@ ROOT=""
 for d in "$WORK" "$WORK"/* "$WORK"/*/*; do
     [ -f "$d/root/usr/lib/homeproxy/homeproxy.lua" ] && { ROOT="$d/root"; break; }
 done
-[ -n "$ROOT" ] || [ -f "$WORK/usr/lib/homeproxy/homeproxy.lua" ] && ROOT="$WORK"
+[ -n "$ROOT" ] || { [ -f "$WORK/usr/lib/homeproxy/homeproxy.lua" ] && ROOT="$WORK"; }
 [ -n "$ROOT" ] || die "could not locate repo root/ tree in archive"
 log "source root: $ROOT"
 
