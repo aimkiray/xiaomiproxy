@@ -202,7 +202,7 @@ start_service() {
         # proxy_list.txt: always-proxy domains -> sing-box DNS + wan_proxy ipset.
         if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/proxy_list.txt" ]; then
             awk -v dp="$hp_dns_port" -v v6="$wan_v6" \
-                'NF && !/^#/ {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_wan_proxy4"v6}' \
+                '{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_wan_proxy4"v6}' \
                 "$HP_DIR/resources/proxy_list.txt" > /tmp/dnsmasq.d/homeproxy_proxy_list.conf
         fi
         # direct_list.txt: always-direct domains -> add to wan_direct ipset so the
@@ -210,7 +210,7 @@ start_service() {
         # server= redirect: let them resolve normally and force-direct by ipset.
         if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/direct_list.txt" ]; then
             awk -v v6="$wan_direct_v6" \
-                'NF && !/^#/ {print "ipset=/"$0"/homeproxy_wan_direct4"v6}' \
+                '{sub(/^[ \t]+/,"");sub(/[ \t]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "ipset=/"$0"/homeproxy_wan_direct4"v6}' \
                 "$HP_DIR/resources/direct_list.txt" > /tmp/dnsmasq.d/homeproxy_direct_list.conf
         fi
         /etc/init.d/dnsmasq restart >/dev/null 2>&1

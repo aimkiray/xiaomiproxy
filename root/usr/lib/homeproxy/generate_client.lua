@@ -102,11 +102,15 @@ if routing_mode ~= "custom" then
     dns_default_strategy = (ipv6_support ~= "1") and "ipv4_only" or nil
 
     local function load_list(name)
-        local d = hp.trim(hp.readfile(hp.HP_DIR .. "/resources/" .. name))
+        local d = hp.readfile(hp.HP_DIR .. "/resources/" .. name)
         if not d then return nil end
-        local raw = hp.split(d, "[\r\n]+")
         local cl = {}
-        for _, v in ipairs(raw) do if v ~= "" then cl[#cl + 1] = v end end
+        for v in (d .. "\n"):gmatch("([^\r\n]*)") do
+            v = v:match("^%s*(.-)%s*$")
+            if v ~= "" and not v:match("^#") and v:match("^[A-Za-z0-9._-]+$") then
+                cl[#cl + 1] = v
+            end
+        end
         return next(cl) ~= nil and cl or nil
     end
     direct_domain_list = load_list("direct_list.txt")

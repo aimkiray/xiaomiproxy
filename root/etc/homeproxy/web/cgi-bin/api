@@ -58,7 +58,7 @@ case "$Q_lines" in *[!0-9]*) Q_lines=80 ;; esac
 read_body() {
 	local n="${CONTENT_LENGTH:-0}"
 	case "$n" in *[!0-9]*) n=0 ;; esac
-	[ "$n" -gt 0 ] 2>/dev/null && dd bs=1 count="$n" 2>/dev/null || true
+	[ "$n" -gt 0 ] 2>/dev/null && head -c "$n" 2>/dev/null || true
 }
 
 valid_mode() {
@@ -154,10 +154,20 @@ set_direct_list|set_proxy_list)
 	esac
 	RES_DIR="$HP_RES_DIR"
 	mkdir -p "$RES_DIR" 2>/dev/null
-	n="${CONTENT_LENGTH:-0}"
-	case "$n" in *[!0-9]*) n=0 ;; esac
-	# write the raw body (CRLF -> LF); empty body clears the list
-	dd bs=1 count="$n" 2>/dev/null | tr -d '\r' > "$RES_DIR/$file" 2>/dev/null || true
+	# sanitize the body (CRLF -> LF, trim each line). Keep comments; drop
+	# blank lines. Reject any non-comment line that is not a plain domain
+	# ([A-Za-z0-9._-]+): a '/' or whitespace would break dnsmasq server=/
+	# ipset= delimiters and take DNS down silently. Empty body clears the list.
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.list.$$"
+	badf="${tmp}.bad"
+	read_body | tr -d '\r' | awk -v bad="$badf" '{ sub(/^[ \t]+/,""); sub(/[ \t]+$/,"") } !NF { next } /^#/ { print; next } $0 !~ /^[A-Za-z0-9._-]+$/ { print > bad; next } { print }' > "$tmp"
+	if [ -s "$badf" ]; then
+		msg=$(tr "\n" "," < "$badf" | sed "s/,$//; s/[^A-Za-z0-9._,-]/?/g")
+		rm -f "$tmp" "$badf"
+		json_err "invalid domain line(s): $msg"
+	fi
+	rm -f "$badf"
+	mv -f "$tmp" "$RES_DIR/$file" 2>/dev/null || { rm -f "$tmp"; json_err "write failed"; }
 	do_restart
 	json_ok '{"ok":true,"file":"'"$file"'"}'
 	;;
