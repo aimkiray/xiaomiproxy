@@ -160,7 +160,8 @@ set_direct_list|set_proxy_list)
 	# ipset= delimiters and take DNS down silently. Empty body clears the list.
 	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.list.$$"
 	badf="${tmp}.bad"
-	read_body | tr -d '\r' | awk -v bad="$badf" '{ sub(/^[ \t]+/,""); sub(/[ \t]+$/,"") } !NF { next } /^#/ { print; next } $0 !~ /^[A-Za-z0-9._-]+$/ { print > bad; next } { print }' > "$tmp"
+	# tr strips CR above; \r in the class is defense-in-depth.
+	read_body | tr -d '\r' | awk -v bad="$badf" '{ sub(/^[ \t\r]+/,""); sub(/[ \t\r]+$/,"") } !NF { next } /^#/ { print; next } $0 !~ /^[A-Za-z0-9._-]+$/ { print > bad; next } { print }' > "$tmp"
 	if [ -s "$badf" ]; then
 		msg=$(tr "\n" "," < "$badf" | sed "s/,$//; s/[^A-Za-z0-9._,-]/?/g")
 		rm -f "$tmp" "$badf"
