@@ -112,25 +112,22 @@ local function is_ip6(s)
     if s:sub(1, 1) == ":" and s:sub(2, 2) ~= ":" then return false end
     if s:sub(-1, -1) == ":" and s:sub(-2, -2) ~= ":" then return false end
     local groups = 0
-    local seen_double = false
-    for part in s:gmatch("([0-9a-fA-F]*)") do
-        if part == "" then
-            -- consecutive colons; allow at most one "::"
-        else
-            if #part > 4 then return false end
-            groups = groups + 1
-        end
+    local seen_double = s:find("::", 1, true) ~= nil
+    local _, doubles = s:gsub("::", "")
+    if doubles > 1 or s:find(":::", 1, true) then return false end
+    for part in s:gmatch("[^:]+") do
+        if #part > 4 then return false end
+        groups = groups + 1
     end
-    -- crude: require at least a plausible structure
-    if s:find("::") then seen_double = true end
-    if not seen_double and groups ~= 8 then return false end
+    -- A double colon represents at least one omitted group.
+    if (seen_double and groups > 7) or (not seen_double and groups ~= 8) then return false end
     return true
 end
 
 local function is_hostname(s)
     if s == "" then return false end
     if s:match("^[a-zA-Z0-9_]+$") then return true end
-    if s:match("^[a-zA-Z0-9_][a-zA-Z0-9_%%%-%.]*[a-zA-Z0-9_]$") and s:match("[^0-9%.]") then
+    if s:match("^[a-zA-Z0-9_][a-zA-Z0-9_%-%.]*[a-zA-Z0-9_]$") and s:match("[^0-9%.]") then
         return true
     end
     return false
@@ -184,12 +181,21 @@ end
 -- ---------------------------------------------------------------------------
 -- md5 (shell out to busybox md5sum; small and reliable)
 -- ---------------------------------------------------------------------------
+-- Subscription updates hash the same labels/configurations more than once.
+-- Keep a process-local cache: this script is short-lived, so it is bounded by
+-- one update run and does not create persistent state on the router.
+local md5_cache = {}
 function _M.md5(s)
     if s == nil then return nil end
-    local h = io.popen("printf %s " .. _M.shellQuote(s) .. " | md5sum 2>/dev/null | cut -d' ' -f1")
-    local r = h:read("*l")
-    h:close()
-    return _M.trim(r)
+    s = tostring(s)
+    if md5_cache[s] then return md5_cache[s] end
+    local h = io.popen("printf %s " .. _M.shellQuote(s) .. " | md5sum 2>/dev/null")
+    local line = h and h:read("*l") or nil
+    if h then h:close() end
+    local r = line and line:match("^([^%s]+)") or nil
+    r = _M.trim(r)
+    if r then md5_cache[s] = r end
+    return r
 end
 
 -- ---------------------------------------------------------------------------
@@ -197,6 +203,9 @@ end
 -- ---------------------------------------------------------------------------
 function _M.urldecode(s)
     if not s then return nil end
+    -- Keep upstream/form semantics for query strings and labels.  Protocol
+    -- userinfo that needs URI-component semantics is decoded locally by the
+    -- subscription parser.
     s = s:gsub("+", " ")
     s = s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
     return s
@@ -236,8 +245,10 @@ function _M.parseURL(url)
         v = v:gsub("^([^@]+)@", function(u) o.userinfo = u; return "" end)
         v = v:gsub(":(%d+)$", function(p) o.port = p; return "" end)
         local bare = v:gsub("[%[%]]", "")
-        if _M.validation("ip4addr", v) or _M.validation("ip6addr", bare) or _M.validation("hostname", v) then
+        if _M.validation("ip4addr", v) or _M.validation("hostname", v) then
             o.hostname = v
+        elseif _M.validation("ip6addr", bare) then
+            o.hostname = bare
         end
         return ""
     end)
@@ -247,12 +258,14 @@ function _M.parseURL(url)
 
     if o.userinfo then
         o.userinfo = o.userinfo:gsub(":(.+)$", function(v) o.password = v; return "" end)
-        if o.userinfo:match("^[A-Za-z0-9%+%-%_%.]+$") then
-            o.username = o.userinfo
-        end
+        -- Userinfo is opaque protocol data; scheme-specific parsers decide
+        -- whether it is plaintext or base64.  Do not reject valid URI
+        -- sub-delimiters such as '=' and '/' here.
+        o.username = o.userinfo
         o.userinfo = nil
     end
 
+    if o.port and not _M.validation("port", o.port) then return nil end
     if not o.port then o.port = services[o.protocol] end
     o.host = o.hostname .. (o.port and (":" .. o.port) or "")
     o.origin = o.protocol .. "://" .. o.host

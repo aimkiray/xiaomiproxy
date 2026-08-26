@@ -11,7 +11,8 @@ Target environment verified on a Xiaomi router (OpenWrt 18.06 base, kernel 5.4, 
   - `homeproxy.lua` — shared helpers (URL/base64/md5, `uci` wrapper, JSON via `luci.json`, `clean()`/`encode_json`).
   - `generate_client.lua`, `generate_server.lua` — build `sing-box` JSON from UCI.
   - `migrate_config.lua` — idempotent defaults/deprecated-option cleanup.
-  - `update_subscriptions.lua` — fetch/parse share-links (`ss/vmess/vless/trojan/hysteria2/http/socks/tuic/anytls` + SIP008), write nodes.
+  - `update_subscriptions.lua` — fetch subscriptions, detect sing-box features (cached), write nodes to UCI; delegates protocol parsing to `subscription_parser.lua`.
+  - `subscription_parser.lua` — pure share-link/SIP008 parser, node normalizer, subscription body decoder, and filter matcher; no UCI/service/IO dependencies.
   - `firewall.sh` — iptables+ipset rules (TCP redirect, UDP tproxy, DNS hijack, CN bypass).
 - `root/usr/bin/homeproxy` — CLI (`start/stop/generate/subscribe/nodes/add/set/...`).
 - `root/etc/init.d/homeproxy` — procd service: runs lua generators, sets tproxy routing table, starts sing-box, applies firewall.
