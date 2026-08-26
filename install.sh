@@ -242,10 +242,16 @@ install_file() {  # <src> <dst> <mode> <policy: always|if_missing>
 }
 
 log "laying down files..."
-for f in homeproxy.lua generate_client.lua generate_server.lua migrate_config.lua update_subscriptions.lua firewall.sh firewall_include.sh; do
-    install_file "$ROOT/usr/lib/homeproxy/$f" "$LIB/$f" 644 always
+# Glob all .lua modules (matches Makefile's *.lua install); any new module
+# is auto-deployed without updating a hardcoded list.
+for f in "$ROOT"/usr/lib/homeproxy/*.lua; do
+    [ -f "$f" ] || continue
+    install_file "$f" "$LIB/$(basename "$f")" 644 always
 done
-chmod 755 "$LIB/firewall.sh" "$LIB/firewall_include.sh"
+# Shell scripts get 755 directly.
+for f in firewall.sh firewall_include.sh; do
+    install_file "$ROOT/usr/lib/homeproxy/$f" "$LIB/$f" 755 always
+done
 install_file "$ROOT/usr/bin/homeproxy" "$BIN/homeproxy" 755 always
 for f in clean_log.sh update_crond.sh update_resources.sh; do
     install_file "$ROOT/etc/homeproxy/scripts/$f" "$SCR/$f" 755 always
