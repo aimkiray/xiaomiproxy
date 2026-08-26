@@ -12,7 +12,7 @@ Verified on a Xiaomi router with **sing-box 1.13.15** (1.14.x not tested), `ipta
 
 - Routing modes: `bypass_mainland_china`, `global`, `gfwlist`, `proxy_mainland_china`, `custom`.
 - Proxy modes: `redirect_tproxy` (TCP redirect + UDP tproxy + DNS hijack), `tun` (best-effort).
-- Subscriptions: `ss`/`vmess`/`vless`/`trojan`/`hysteria2`/`http`/`socks`/`tuic`/`anytls` share-links + SIP008.
+- Subscriptions: `ss`/`vmess`/`vless`/`trojan`/`hysteria`/`hysteria2`/`http`/`socks`/`tuic`/`anytls` share-links + SIP008; subscription parsing is modularized into `subscription_parser.lua` (no UCI/IO deps, pure Lua 5.1).
 - LAN proxy control: `disabled` / `only_proxy` / `listed_only` / `except_listed` (the last two use per-IP/MAC lists).
 - Force-direct / force-proxy **domain lists** (fed to both dnsmasq `ipset=`/`server=` and sing-box inline rule-sets).
 - Node TCP/HTTP delay (ms) via the sing-box Clash API; Google/Baidu connectivity test.
@@ -54,7 +54,7 @@ Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dro
 ## Project layout
 
 - `Makefile` — OpenWrt package definition (`Package/homeproxy`).
-- `root/usr/lib/homeproxy/` — Lua backend (`homeproxy.lua`, `generate_client.lua`, `generate_server.lua`, `migrate_config.lua`, `update_subscriptions.lua`) + `firewall.sh` (iptables/ipset) + `firewall_include.sh` (fw3 reload hook).
+- `root/usr/lib/homeproxy/` — Lua backend (`homeproxy.lua`, `generate_client.lua`, `generate_server.lua`, `migrate_config.lua`, `update_subscriptions.lua`, `subscription_parser.lua`) + `firewall.sh` (iptables/ipset) + `firewall_include.sh` (fw3 reload hook).
 - `root/usr/bin/homeproxy` — CLI.
 - `root/etc/init.d/homeproxy` — procd service: generators + dnsmasq steering + firewall.
 - `root/etc/init.d/homeproxy-web` — standalone uhttpd for the web UI (LAN-only, no auth).
@@ -63,6 +63,8 @@ Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dro
 - `root/etc/homeproxy/resources/` — geodata/lists (`china_ip4/6.txt`, `china_list.txt`, `gfw_list.txt`; `direct_list.txt`/`proxy_list.txt` are created on demand).
 - `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh`, `boot_restore.sh`.
 - `install.sh` — on-router installer/upgrader.
+- `tests/` — Python test replicas of the Lua URL/SS parser and subscription helpers (no on-device Lua interpreter needed).
+- `docs/` — design review notes (`ss-subscription-review.md`).
 
 ## Notes / limitations
 
