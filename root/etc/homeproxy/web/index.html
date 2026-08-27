@@ -126,13 +126,13 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
 <script>
 const API='/cgi-bin/api';
 const $=id=>document.getElementById(id);
-let cfg=null,tailTimer=null,busy={},pingResults=null,lastMain=null,lastMode=null,lastLan=null;
+let cfg=null,tailTimer=null,stateTimer=null,busy={},refreshing=false,pingResults=null,lastMain=null,lastMode=null,lastLan=null;
 
 function toast(msg,ms=2600){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms)}
-async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});return r.text()}
+async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});if(!r.ok)throw new Error('HTTP '+r.status);return r.text()}
 async function apiJson(action,opts={}){const t=await api(action,opts);try{return JSON.parse(t)}catch(e){throw new Error('bad json: '+t.slice(0,120))}}
 
-function fmtKV(o){return Object.entries(o).map(([k,v])=>`<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')}
+function fmtKV(o){return Object.entries(o).map(([k,v])=>`<div class="kv"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join('')}
 
 async function loadState(){
  try{
@@ -159,7 +159,7 @@ async function loadConfig(){
   const t=await api('config');cfg=JSON.parse(t);
   const sel=$('node');
   const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
-  sel.innerHTML='<option value="nil">— none (nil) —</option><option value="urltest">urltest (auto)</option>'+nodes.map(([k,v])=>`<option value="${k}">${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
+  sel.innerHTML='<option value="nil">— none (nil) —</option><option value="urltest">urltest (auto)</option>'+nodes.map(([k,v])=>`<option value="${esc(k)}">${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
   if(lastMain!==null&&[...sel.options].some(o=>o.value===lastMain))sel.value=lastMain;
   if(pingResults)setNodeMs(pingResults);
  }catch(e){toast('config: '+e.message)}
@@ -181,7 +181,7 @@ function setNodeMs(results){
  });
 }
 async function pingNodes(){
- setBusy('btnPing',true);
+ if(busy.btnPing)return;setBusy('btnPing',true);
  try{const r=await apiJson('ping_nodes');if(r.ok&&r.results){pingResults=r.results;setNodeMs(r.results)}else toast('ping failed: '+(r.error||''))}catch(e){toast('ping failed: '+e.message)}finally{setBusy('btnPing',false)}
 }
 
@@ -192,32 +192,32 @@ function renderConn(el,r){
  el.style.color=r.ok?'var(--ok)':'var(--bad)';
 }
 async function testConn(){
- setBusy('btnConn',true);
+ if(busy.btnConn)return;setBusy('btnConn',true);
  try{const r=await apiJson('connectivity');if(r.ok){renderConn($('connGoogle'),r.google);renderConn($('connBaidu'),r.baidu)}else toast('connectivity failed: '+(r.error||''))}
  catch(e){toast('connectivity failed: '+e.message)}finally{setBusy('btnConn',false)}
 }
 
 async function applyNode(){
- const v=$('node').value;setBusy('applyNode',true);
+ if(busy.applyNode)return;const v=$('node').value;setBusy('applyNode',true);
  try{const r=await apiJson('set_main_node',{method:'POST',body:v});toast(r.ok?'Main node set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyNode',false)}
 }
 async function applyMode(){
- const v=$('mode').value;setBusy('applyMode',true);
+ if(busy.applyMode)return;const v=$('mode').value;setBusy('applyMode',true);
  try{const r=await apiJson('set_routing_mode',{method:'POST',body:v});toast(r.ok?'Routing mode set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyMode',false)}
 }
 async function applyLanProxy(){
- const v=$('lanproxy').value;setBusy('applyLanProxy',true);
+ if(busy.applyLanProxy)return;const v=$('lanproxy').value;setBusy('applyLanProxy',true);
  try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
 }
 async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||''}catch(e){toast('domain lists: '+e.message)}}
-async function applyDirectList(){const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
-async function applyProxyList(){const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
+async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
+async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
 async function doSubscribe(){
- setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
+ if(busy.btnSub)return;setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
  try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
 }
 async function doRestart(){
- setBusy('btnRestart',true);toast('restarting…');
+ if(busy.btnRestart)return;setBusy('btnRestart',true);toast('restarting…');
  try{await apiJson('restart',{method:'POST'});toast('proxy restarted');setTimeout(refresh,1500)}catch(e){toast('restart failed: '+e.message)}finally{setBusy('btnRestart',false)}
 }
 async function loadLog(){
@@ -228,7 +228,7 @@ function toggleTail(){
  else{tailTimer=setInterval(loadLog,4000);$('btnTail').textContent='Auto-tail: on';loadLog()}
 }
 
-async function refresh(){await loadConfig();await loadDomainLists();await loadLog()}
+async function refresh(){if(refreshing)return;refreshing=true;try{await Promise.all([loadConfig(),loadDomainLists(),loadLog()])}finally{refreshing=false}}
 
 $('btnPing').onclick=pingNodes;
 $('btnConn').onclick=testConn;
@@ -244,7 +244,11 @@ $('btnLog').onclick=loadLog;
 $('btnTail').onclick=toggleTail;
 
 refresh();
-setInterval(loadState,5000);
+stateTimer=setInterval(loadState,5000);
+document.addEventListener('visibilitychange',()=>{
+ if(document.hidden){if(stateTimer){clearInterval(stateTimer);stateTimer=null}}
+ else if(!stateTimer){loadState();stateTimer=setInterval(loadState,5000)}
+});
 </script>
 </body>
 </html>

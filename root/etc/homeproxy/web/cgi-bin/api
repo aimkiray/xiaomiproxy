@@ -41,7 +41,9 @@ text_out() { hdr 'Content-Type: text/plain; charset=utf-8'; printf '%s' "$1"; }
 
 # escape a string for a JSON double-quoted value (newlines -> \n)
 jesc() {
-	printf '%s' "$1" | tr -d '\r' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
+	# Strip all control chars except \t (0x09) and \n (0x0a) to keep
+	# the output valid JSON; \r (0x0d) is in the \013-\037 range.
+	printf '%s' "$1" | tr -d '\000-\010\013-\037\177' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' \
 		| awk '{printf "%s%s",sep,$0; sep="\\n"} END{print ""}'
 }
 
