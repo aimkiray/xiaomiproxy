@@ -81,12 +81,14 @@ end
 
 -- The upstream ucode implementation appends "s" so numeric seconds become
 -- sing-box duration strings ("300" -> "300s").  Check if the input already
--- has a sing-box duration unit to avoid double-suffixing (M15: "30m" -> "30ms").
+-- has a valid sing-box duration unit to avoid double-suffixing (M15).
+-- sing-box accepts: <number>s, <number>m, <number>h, <number>d, <number>ms
 function _M.strToTime(str)
     if _M.isEmpty(str) then return nil end
     local s = tostring(str)
-    -- sing-box duration units: s, m, h, d, ms
-    if s:match("[%a]$") then return s end  -- already has a unit
+    -- Already has a valid sing-box duration suffix?  Match patterns like
+    -- "300s", "30m", "1h", "2d", "500ms" (and optional fractional part).
+    if s:match("^%d+ms$") or s:match("^%d+%.?%d*[smhd]$") then return s end
     return s .. "s"
 end
 
@@ -142,13 +144,15 @@ local function is_hostname(s)
     if not s:match("%.") then
         return s:match("^[a-zA-Z0-9_]+$") ~= nil
     end
-    -- Multi-label: validate each label per RFC 1123 (M11).
+    -- Multi-label: validate each label.  Allow underscores for backward
+    -- compatibility (SRV/TXT records use them; RFC 1123 forbids them but
+    -- real-world proxy configs may contain them).
     for label in s:gmatch("[^.]+") do
         if #label == 0 or #label > 63 then return false end
-        -- Label must not start or end with hyphen; only alnum + hyphen allowed.
-        if not label:match("^[a-zA-Z0-9][a-zA-Z0-9%-]*[a-zA-Z0-9]$") then
-            -- Allow single-char labels (just alnum).
-            if not label:match("^[a-zA-Z0-9]$") then return false end
+        -- Label must not start or end with hyphen; alnum + hyphen + underscore.
+        if not label:match("^[a-zA-Z0-9_][a-zA-Z0-9_%-]*[a-zA-Z0-9_]$") then
+            -- Allow single-char labels (just alnum/underscore).
+            if not label:match("^[a-zA-Z0-9_]$") then return false end
         end
     end
     -- Must contain at least one non-numeric label (avoid pure-numeric "123.456").

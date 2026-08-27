@@ -541,7 +541,7 @@ if not isEmpty(main_node) then
         -- outbounds array, producing a config sing-box rejects ("outbounds
         -- required").  Fall back to direct-out so the config remains valid.
         if #nodes == 0 then
-            log_empty_urltest = true
+            io.stderr:write("homeproxy: WARNING: main_urltest_nodes is empty -- falling back to direct outbound.\n")
             push(config.outbounds, { type = "direct", tag = "main-out" })
         else
             local interval = uget(UCIMAIN, "main_urltest_interval")

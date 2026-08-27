@@ -25,31 +25,30 @@ local function push(t, v) t[#t + 1] = v end
 local function log(msg) hp.log(msg, "SUBSCRIBE") end
 
 -- Concurrency lock: prevent cron + manual update from clobbering each other.
+-- Read-first approach: check for a live PID before truncating the file.
 local lock_path = hp.RUN_DIR .. "/subscribe.lock"
-local lock_f = io.open(lock_path, "w")
-if lock_f then
-  -- O_EXCL-style: if the file already exists from another running instance,
-  -- we don't get an error from io.open("w") (it truncates), so use a pid check.
+do
   local prev_pid = hp.trim(hp.readfile(lock_path) or "")
-  if prev_pid and prev_pid ~= "" and os.execute("kill -0 " .. hp.shellQuote(prev_pid) .. " 2>/dev/null") == 0 then
-    log("Another subscription update is running (pid=" .. prev_pid .. "), aborting.")
-    os.exit(0)
-  end
-  lock_f:seek("set", 0)
-  lock_f:write(tostring(os.getenv("HP_PID") or ""))
-  -- Use os.time as a fallback pid surrogate if HP_PID is unset.
-  lock_f:write("")
-  lock_f:close()
-  -- Write our process id via a shell call since Lua 5.1 has no getpid().
-  local pf = io.popen("echo $$")
-  if pf then local pid = hp.trim(pf:read("*a") or ""); pf:close()
-    if pid and pid ~= "" then
-      local wf = io.open(lock_path, "w")
-      if wf then wf:write(pid); wf:close() end
+  if prev_pid and prev_pid ~= "" then
+    -- Check if that process is still alive.
+    if os.execute("kill -0 " .. hp.shellQuote(prev_pid) .. " 2>/dev/null") == 0 then
+      log("Another subscription update is running (pid=" .. prev_pid .. "), aborting.")
+      os.exit(0)
     end
   end
-else
-  log("WARNING: could not create lock file, proceeding without concurrency protection.")
+  -- Write our PID into the lock file.  We use a subshell's $$ as a proxy
+  -- for the Lua PID (Lua 5.1 has no getpid).  The lock is advisory — a
+  -- stale PID (from a crashed run) is detected by kill -0 above.
+  local pf = io.popen("echo $$")
+  local pid = pf and hp.trim(pf:read("*a") or "") or ""
+  if pf then pf:close() end
+  local wf = io.open(lock_path, "w")
+  if wf then
+    wf:write(pid)
+    wf:close()
+  else
+    log("WARNING: could not create lock file, proceeding without concurrency protection.")
+  end
 end
 
 local allow_insecure    = uci:get(CFG, UCISUB, "allow_insecure") or "0"

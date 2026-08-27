@@ -178,6 +178,7 @@ cleanup_volatile() {
 
 if [ "$ROLLBACK" = 1 ]; then
     do_rollback
+    DONE=1  # Prevent EXIT trap from triggering a second rollback (F2).
     exit 0
 fi
 
@@ -213,11 +214,12 @@ elif [ -n "$paths" ]; then
 else
     tar -C / -czf "$BACKUP_TAR" --no-recursion /dev/null 2>/dev/null || true
 fi
-cat > "$BACKUP_META" <<EOF
+cat > "$BACKUP_META.tmp" <<EOF
 HP_FW_INC="$HP_FW_INC"
 HP_FW_PATH="$HP_FW_PATH"
 HP_WAS_RUNNING="$HP_WAS_RUNNING"
 EOF
+mv "$BACKUP_META.tmp" "$BACKUP_META"
 log "backup saved: $BACKUP_TAR"
 
 # -- sing-box (download if missing) -----------------------------------------

@@ -72,6 +72,20 @@ start_service() {
         fi
 
         # Config validated — now safe to mutate routing/firewall state (H9).
+        # Generate + validate server config too, so a server config failure
+        # doesn't leave client routing/tun/cron state half-applied.
+        local server_cfg_ok=1
+        if [ "$server_enabled" = "1" ]; then
+            lua "$HP_LUA_DIR/generate_server.lua" 2>>"$LOG_PATH"
+            if [ ! -e "$RUN_DIR/sing-box-s.json" ]; then
+                log "Error: failed to generate server configuration."
+                return 1
+            elif ! "$PROG" check --config "$RUN_DIR/sing-box-s.json" 2>>"$LOG_PATH"; then
+                log "Error: wrong server configuration detected."
+                return 1
+            fi
+        fi
+
         # auto subscription update
         local auto_update auto_update_time
         config_get_bool auto_update "subscription" "auto_update" "0"
@@ -140,15 +154,6 @@ start_service() {
     fi
 
     if [ "$server_enabled" = "1" ]; then
-        lua "$HP_LUA_DIR/generate_server.lua" 2>>"$LOG_PATH"
-        if [ ! -e "$RUN_DIR/sing-box-s.json" ]; then
-            log "Error: failed to generate server configuration."
-            return 1
-        elif ! "$PROG" check --config "$RUN_DIR/sing-box-s.json" 2>>"$LOG_PATH"; then
-            log "Error: wrong server configuration detected."
-            return 1
-        fi
-
         [ -e "$RUN_DIR/sing-box-s.log" ] && : > "$RUN_DIR/sing-box-s.log"
         procd_open_instance "sing-box-s"
         procd_set_param command "$PROG"

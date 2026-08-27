@@ -190,7 +190,10 @@ load_list_ipset() {
 }
 
 if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; then
-	build_ipset homeproxy_cn4 "$RES_DIR/china_ip4.txt" inet
+	build_ipset homeproxy_cn4 "$RES_DIR/china_ip4.txt" inet || {
+		echo "homeproxy: FATAL: failed to create CN ipset (ipset binary or kmod missing?). Aborting." >&2
+		stop_fw; exit 1
+	}
 	[ "$ipv6" = "1" ] && build_ipset homeproxy_cn6 "$RES_DIR/china_ip6.txt" inet6
 	cn_cnt=$(ipset list homeproxy_cn4 2>/dev/null | awk '/Number of entries/{print $4}')
 	[ -z "$cn_cnt" ] && cn_cnt=0
@@ -205,7 +208,13 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
 	if [ "$ipv6" = "1" ]; then
 		cn6_cnt=$(ipset list homeproxy_cn6 2>/dev/null | awk '/Number of entries/{print $4}')
 		[ -z "$cn6_cnt" ] && cn6_cnt=0
-		[ "$cn6_cnt" -le 0 ] && echo "homeproxy: WARNING: CN ipset empty/missing ($RES_DIR/china_ip6.txt) -- v6 $routing_mode will proxy all traffic." >&2
+		[ "$cn6_cnt" -le 0 ] && {
+			if [ "$routing_mode" = "bypass_mainland_china" ]; then
+				echo "homeproxy: WARNING: v6 CN ipset empty -- bypass_mainland_china will proxy all v6 traffic." >&2
+			elif [ "$routing_mode" = "proxy_mainland_china" ]; then
+				echo "homeproxy: WARNING: v6 CN ipset empty -- proxy_mainland_china will proxy no v6 traffic (all direct)." >&2
+			fi
+		}
 	fi
 fi
 
@@ -507,11 +516,6 @@ udp_tproxy=0
 if [ "$main_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
 	udp_tproxy=1
 fi
-
-# Error tracking wrapper (H7): detect critical iptables failures so the
-# firewall doesn't silently apply a partial rule set.
-hp_fw_err=0
-hp_ipt() { "$@" 2>/dev/null || { hp_fw_err=1; echo "homeproxy: ipt rule failed: $*" >&2; }; }
 
 if echo "$proxy_mode" | grep -q redirect; then
 	apply_tcp "$IP4" "$route_set4"
