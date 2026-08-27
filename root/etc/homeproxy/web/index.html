@@ -103,6 +103,15 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
  </div>
 
  <div class="card">
+  <h2>Subscription URLs</h2>
+  <div class="row" style="align-items:flex-start">
+   <textarea id="subUrls" rows="4" placeholder="one URL per line (https://, http://, or sip008://)"></textarea>
+   <button id="applySubUrls" class="ghost">Apply</button>
+  </div>
+  <div class="sub" style="margin-top:8px">Edit subscription links, then click Update subscription below to fetch nodes.</div>
+ </div>
+
+ <div class="card">
   <h2>Actions</h2>
   <div class="opts">
    <button id="btnSub" class="ghost">Update subscription</button>
@@ -169,6 +178,13 @@ async function loadConfig(){
   if(pingResults)setNodeMs(pingResults);
  }catch(e){toast('config: '+e.message)}
  await loadState();
+ loadSubUrls();
+}
+
+function loadSubUrls(){
+ if(!cfg||!cfg.values)return;
+ const u=cfg.values.subscription&&cfg.values.subscription.subscription_url;
+ $('subUrls').value=u?(Array.isArray(u)?u:[u]).join('\n'):'';
 }
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -217,6 +233,7 @@ async function applyLanProxy(){
 async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||''}catch(e){toast('domain lists: '+e.message)}}
 async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
 async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
+async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
 async function doSubscribe(){
  if(busy.btnSub)return;setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
  try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
@@ -242,6 +259,7 @@ $('applyMode').onclick=applyMode;
 $('applyLanProxy').onclick=applyLanProxy;
 $('applyDirect').onclick=applyDirectList;
 $('applyProxy').onclick=applyProxyList;
+$('applySubUrls').onclick=applySubUrls;
 $('btnSub').onclick=doSubscribe;
 $('btnRestart').onclick=doRestart;
 $('btnRefresh').onclick=refresh;

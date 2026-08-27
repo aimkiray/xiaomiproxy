@@ -76,7 +76,7 @@ do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1;
 # Write endpoints require POST -- this is an unauthenticated LAN API, so
 # guard against an accidental GET clearing a list or triggering a restart.
 case "$Q_action" in
-	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|subscribe|restart)
+	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|subscribe|restart)
 		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})" ;;
 esac
 
@@ -175,6 +175,39 @@ set_direct_list|set_proxy_list)
 	json_ok '{"ok":true,"file":"'"$file"'"}'
 	;;
 
+set_subscription_urls)
+	# Replace the subscription_url UCI list from a newline-separated
+	# body.  Two-pass: validate-all-then-save so a single bad line
+	# does not wipe the existing list.  Must start with http(s):// or
+	# sip008:// — same scheme check as update_subscriptions.lua.
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.suburls.$$"
+	read_body >"$tmp"
+	bad=""
+	while IFS= read -r line; do
+		line=$(printf '%s' "$line" | sed 's/^[ \t\r]*//;s/[ \t\r]*$//')
+		[ -z "$line" ] && continue
+		case "$line" in
+			https://*|http://*|sip008://*) : ;;
+			*) bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')" ;;
+		esac
+	done <"$tmp"
+	if [ -n "$bad" ]; then
+		rm -f "$tmp"
+		json_err "invalid URL(s): $bad (must start with http(s):// or sip008://)"
+	fi
+	uci -q delete $CONF.subscription.subscription_url 2>/dev/null
+	cnt=0
+	while IFS= read -r line; do
+		line=$(printf '%s' "$line" | sed 's/^[ \t\r]*//;s/[ \t\r]*$//')
+		[ -z "$line" ] && continue
+		uci add_list $CONF.subscription.subscription_url="$line"
+		cnt=$((cnt+1))
+	done <"$tmp"
+	rm -f "$tmp"
+	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	json_ok "{\"ok\":true,\"count\":$cnt}"
+	;;
+
 ping_nodes)
 	# Per-node delay (ms) via the sing-box Clash API (loopback 127.0.0.1:19290).
 	# Requires generate_client.lua experimental.clash_api + a restart. Tests a
@@ -264,7 +297,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list ping_nodes connectivity subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls ping_nodes connectivity subscribe restart log"
 	;;
 
 *)
