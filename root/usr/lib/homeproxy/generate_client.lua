@@ -118,7 +118,7 @@ if routing_mode ~= "custom" then
 
     sniff_override = uget(UCIINFRA, "sniff_override") or "1"
 else
-    dns_default_strategy  = uget(UCIDNS, "default_strategy")
+    dns_default_strategy  = uget(UCIDNS, "default_strategy") or uget(UCIDNS, "dns_strategy")
     dns_default_server     = uget(UCIDNS, "default_server")
     dns_disable_cache      = uget(UCIDNS, "disable_cache")
     dns_disable_cache_expire = uget(UCIDNS, "disable_cache_expire")
@@ -395,9 +395,9 @@ end
 config.dns = {
     servers = {
         { tag = "default-dns", type = "udp", server = wan_dns,
-          detour = self_mark and "direct-out" or nil },
+          detour = "direct-out" },
         { tag = "system-dns", type = "local",
-          detour = self_mark and "direct-out" or nil },
+          detour = "direct-out" },
     },
     rules = {},
     strategy = dns_default_strategy,
@@ -434,7 +434,7 @@ if not isEmpty(main_node) then
         local c_dns = {
             tag = "china-dns",
             domain_resolver = { server = "default-dns", strategy = "prefer_ipv6" },
-            detour = self_mark and "direct-out" or nil,
+            detour = "direct-out",
         }
         for k, v in pairs(parse_dnsserver(china_dns_server) or {}) do c_dns[k] = v end
         push(config.dns.servers, c_dns)
@@ -536,15 +536,24 @@ if not isEmpty(main_node) then
     local urltest_nodes = {}
     if main_node == "urltest" then
         local nodes = uget(UCIMAIN, "main_urltest_nodes") or {}
-        local interval = uget(UCIMAIN, "main_urltest_interval")
-        local interval_n = strToInt(interval)
-        push(config.outbounds, {
-            type = "urltest", tag = "main-out",
-            outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
-            interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_urltest_tolerance")),
-            idle_timeout = (interval_n and interval_n > 1800)
-                and (interval_n * 2 .. "s") or nil,
-        })
+        if type(nodes) ~= "table" then nodes = { nodes } end
+        -- Guard against empty urltest node list (H16): clean() drops an empty
+        -- outbounds array, producing a config sing-box rejects ("outbounds
+        -- required").  Fall back to direct-out so the config remains valid.
+        if #nodes == 0 then
+            log_empty_urltest = true
+            push(config.outbounds, { type = "direct", tag = "main-out" })
+        else
+            local interval = uget(UCIMAIN, "main_urltest_interval")
+            local interval_n = strToInt(interval)
+            push(config.outbounds, {
+                type = "urltest", tag = "main-out",
+                outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
+                interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_urltest_tolerance")),
+                idle_timeout = (interval_n and interval_n > 1800)
+                    and (interval_n * 2 .. "s") or nil,
+            })
+        end
         urltest_nodes = nodes
     else
         local ncfg = uci:get_all(UCICONFIG, main_node) or {}
@@ -645,11 +654,11 @@ if not isEmpty(main_node) then
 
     if direct_domain_list and #direct_domain_list > 0 then
         push(config.route.rule_set, { type = "inline", tag = "direct-domain",
-            rules = { { domain_keyword = direct_domain_list } } })
+            rules = { { domain_suffix = direct_domain_list } } })
     end
     if proxy_domain_list and #proxy_domain_list > 0 then
         push(config.route.rule_set, { type = "inline", tag = "proxy-domain",
-            rules = { { domain_keyword = proxy_domain_list } } })
+            rules = { { domain_suffix = proxy_domain_list } } })
     end
     if routing_mode == "bypass_mainland_china" then
         push(config.route.rule_set, { type = "remote", tag = "geoip-cn", format = "binary",

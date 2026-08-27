@@ -35,6 +35,7 @@ CONFIRM_FILE=/tmp/hp_install_confirmed
 LOG=/var/run/homeproxy/homeproxy.log
 
 SINGBOX_VER=1.13.15
+SINGBOX_SHA256=""  # If set, sing-box download is verified against this hash.
 SINGBOX_URL_DEFAULT="https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VER}/sing-box_${SINGBOX_VER}_linux_arm64.tar.gz"
 TIMEOUT=${HP_CONFIRM_TIMEOUT:-30}
 
@@ -45,8 +46,14 @@ log() { echo "[hp-install] $*"; }
 die() { echo "[hp-install] ERROR: $*" >&2; exit 1; }
 
 # fetch <url> <out_file>  (curl preferred, wget fallback)
+# Enforces HTTPS-only (C5) and verifies checksum if HP_DOWNLOAD_SHA256 is set (C2).
 fetch() {
     url=$1; out=$2
+    # Reject non-HTTPS URLs to prevent MITM on cleartext downloads (C5).
+    case "$url" in
+        https://*) ;;
+        *) die "refusing non-HTTPS URL (security policy): $url" ;;
+    esac
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$url" -o "$out" || die "download failed: $url"
     elif command -v wget >/dev/null 2>&1; then
@@ -54,6 +61,32 @@ fetch() {
     else
         die "neither curl nor wget available"
     fi
+}
+
+# Verify a file's SHA256 checksum if HP_DOWNLOAD_SHA256 is set (C2).
+# Usage: verify_checksum <file> <expected_sha256_or_empty>
+verify_checksum() {
+    _file=$1; _expected=$2
+    [ -n "$_expected" ] || return 0  # no hash specified — skip
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "WARN: sha256sum not available — skipping checksum verification."
+        return 0
+    fi
+    local actual
+    actual=$(sha256sum "$_file" 2>/dev/null | awk '{print $1}')
+    [ "$actual" = "$_expected" ] || die "checksum mismatch: expected $_expected, got ${actual:-<empty>}"
+}
+
+# Safe tar extraction: validates that no member escapes the target dir (C6).
+# Usage: safe_extract <tarball> <dest_dir>
+safe_extract() {
+    _tar=$1; _dest=$2
+    tar -C "$_dest" -xzf "$_tar" 2>/dev/null || die "extract failed: $_tar"
+    # Verify no extracted path escaped the destination directory.
+    _escaped=$(find "$_dest" -type f 2>/dev/null | while read -r _f; do
+        case "$_f" in "$_dest"/*) ;; *) echo "$_f" ;; esac
+    done)
+    [ -z "$_escaped" ] || die "path traversal detected in archive: $_escaped"
 }
 
 # -- args --------------------------------------------------------------------
@@ -76,22 +109,34 @@ command -v lua >/dev/null 2>&1 || die "lua not found (homeproxy needs lua 5.1)"
 command -v iptables >/dev/null 2>&1 || log "WARN: iptables missing -- tproxy steering will fail"
 command -v ipset >/dev/null 2>&1    || log "WARN: ipset missing -- CN bypass will fail"
 
+# Error-aware EXIT trap: if the script dies after backup but before successful
+# completion, trigger auto-rollback for upgrades (C4).  DONE=1 is set only at
+# the final successful exit.
+DONE=0
+
 # -- rollback (restore last backup) -----------------------------------------
 do_rollback() {
     log "rolling back to previous install..."
     /etc/init.d/homeproxy stop 2>/dev/null
     /etc/init.d/homeproxy-web stop 2>/dev/null
     sleep 1
-    rm -rf "$HP_BASE" /etc/homeproxy
+    # Selectively remove code/config/symlinks but PRESERVE resources/ (C3):
+    # the backup tarball never captured the bulky geodata, so a full rm -rf
+    # would leave the router without china_ip4.txt etc. after rollback.
+    rm -rf "$LIB" "$SCR" "$WEB" "$INITD_PERSIST" "$BIN"
+    rm -f "$HP_BASE/boot_restore.sh" "$HP_BASE/env.sh"
+    rm -rf /etc/homeproxy
     rm -f /etc/init.d/homeproxy /etc/init.d/homeproxy-web /etc/profile.d/homeproxy.sh
     if [ -f "$BACKUP_TAR" ] && [ -s "$BACKUP_TAR" ]; then
-        tar -C / -xzf "$BACKUP_TAR" 2>/dev/null
+        tar -C / -xzf "$BACKUP_TAR" 2>/dev/null || log "WARN: backup extraction may have failed."
         log "backup restored from $BACKUP_TAR"
     else
         log "no backup -- clean removal done (fresh install)"
     fi
+    # Pre-initialize vars to avoid set -u abort on partial BACKUP_META (M from review).
+    HP_FW_INC=""; HP_FW_PATH=""; HP_WAS_RUNNING="no"
     if [ -f "$BACKUP_META" ]; then
-        . "$BACKUP_META"
+        . "$BACKUP_META" 2>/dev/null || true
         if [ "$HP_FW_INC" = "include" ]; then
             uci -q set firewall.homeproxy=include
             uci -q set firewall.homeproxy.type=script
@@ -101,16 +146,14 @@ do_rollback() {
         else
             uci -q delete firewall.homeproxy 2>/dev/null
         fi
-        uci -q commit firewall
+        uci -q commit firewall 2>/dev/null || log "WARN: uci commit firewall failed."
     else
-        # no meta (manual --rollback on a fresh/broken state): drop a now-dangling
-        # fw3 include so a firewall reload never runs a deleted include script.
         uci -q delete firewall.homeproxy 2>/dev/null
-        uci -q commit firewall
+        uci -q commit firewall 2>/dev/null
     fi
     /etc/init.d/dnsmasq restart 2>/dev/null
     /etc/init.d/firewall reload 2>/dev/null
-    if [ -f "$BACKUP_META" ] && . "$BACKUP_META" 2>/dev/null && [ "$HP_WAS_RUNNING" = "yes" ]; then
+    if [ "$HP_WAS_RUNNING" = "yes" ]; then
         /etc/init.d/homeproxy start 2>/dev/null
         /etc/init.d/homeproxy-web start 2>/dev/null
         log "rollback complete, services restarted."
@@ -158,9 +201,15 @@ for p in /etc/init.d/homeproxy /etc/init.d/homeproxy-web /etc/config/homeproxy \
          /etc/profile.d/homeproxy.sh; do
     [ -e "$p" ] && paths="$paths $p"
 done
-if [ -n "$paths" ]; then
-    tar -C / -czf "$BACKUP_TAR" $paths 2>/dev/null \
-        || tar -C / -czf "$BACKUP_TAR" --no-recursion /dev/null 2>/dev/null || true
+# For upgrades: a failed backup must abort (H13). For fresh installs, an empty
+# backup is acceptable (nothing to restore).
+if [ "$UPGRADE" = 1 ] && [ -n "$paths" ]; then
+    tar -C / -czf "$BACKUP_TAR" $paths 2>/dev/null
+    if [ $? -ne 0 ] || [ ! -s "$BACKUP_TAR" ]; then
+        die "backup failed -- aborting upgrade (disk full?)"
+    fi
+elif [ -n "$paths" ]; then
+    tar -C / -czf "$BACKUP_TAR" $paths 2>/dev/null || tar -C / -czf "$BACKUP_TAR" --no-recursion /dev/null 2>/dev/null || true
 else
     tar -C / -czf "$BACKUP_TAR" --no-recursion /dev/null 2>/dev/null || true
 fi
@@ -177,7 +226,8 @@ if [ ! -x "$SINGBOX" ]; then
     mkdir -p "$SINGBOX_DIR" /tmp/hp_sb
     url=${HP_SINGBOX_URL:-$SINGBOX_URL_DEFAULT}
     fetch "$url" /tmp/hp_sb/sb.tar.gz
-    tar -C /tmp/hp_sb -xzf /tmp/hp_sb/sb.tar.gz 2>/dev/null || die "sing-box extract failed"
+    verify_checksum /tmp/hp_sb/sb.tar.gz "${HP_SINGBOX_SHA256:-$SINGBOX_SHA256}"
+    safe_extract /tmp/hp_sb/sb.tar.gz /tmp/hp_sb
     sb=$(find /tmp/hp_sb -type f -name sing-box | head -n1)
     [ -n "$sb" ] || die "sing-box binary not found in archive"
     mv "$sb" "$SINGBOX"; chmod 755 "$SINGBOX"
@@ -188,13 +238,14 @@ fi
 # -- fetch + extract homeproxy source ---------------------------------------
 [ -n "$SRC" ] || die "no source: pass a URL/path arg or set HP_SRC_URL"
 WORK=/tmp/hp_install_src
-rm -rf "$WORK"; mkdir -p "$WORK"
-trap 'rm -rf "$WORK" 2>/dev/null' EXIT
+rm -rf "$WORK" /tmp/hp_sb; mkdir -p "$WORK"
+# EXIT trap: clean temp dirs always; trigger rollback if upgrade failed mid-way (C4).
+trap 'rm -rf "$WORK" /tmp/hp_sb 2>/dev/null; [ "$DONE" = 0 ] && [ "${UPGRADE:-0}" = 1 ] && do_rollback' EXIT
 case "$SRC" in
-    http://*|https://*|ftp://*)
+    https://*)
         log "downloading source: $SRC"
         fetch "$SRC" "$WORK/src.tar.gz"
-        tar -C "$WORK" -xzf "$WORK/src.tar.gz" 2>/dev/null || die "extract failed"
+        safe_extract "$WORK/src.tar.gz" "$WORK"
         ;;
     *)
         if [ -d "$SRC" ]; then
@@ -221,13 +272,14 @@ log "source root: $ROOT"
 # via the symlink) and fall back to /usr/lib/homeproxy on a standard build.
 mkdir -p "$HP_BASE"
 log "writing env.sh (persistent path overrides)..."
-cat > "$HP_BASE/env.sh" <<EOF
+cat > "$HP_BASE/env.sh.tmp" <<EOF
 # generated by install.sh -- MiWiFi persistent layout overrides
 HP_LIB_DIR=$LIB
 HP_RES_DIR=$RES
 HP_BIN_DIR=$BIN
 HP_SINGBOX=$SINGBOX
 EOF
+mv "$HP_BASE/env.sh.tmp" "$HP_BASE/env.sh"
 chmod 644 "$HP_BASE/env.sh"
 
 # -- lay down files ----------------------------------------------------------
@@ -237,7 +289,10 @@ install_file() {  # <src> <dst> <mode> <policy: always|if_missing>
         log "  skip $d (exists)"; return 0
     fi
     mkdir -p "$(dirname "$d")"
-    cp -a "$s" "$d" 2>/dev/null || cp "$s" "$d" || die "copy failed: $s -> $d"
+    # Atomic write: copy to temp then rename (H15) — prevents partial files
+    # if interrupted (e.g. SIGPIPE from curl|sh mid-copy).
+    cp -a "$s" "$d.tmp" 2>/dev/null || cp "$s" "$d.tmp" || die "copy failed: $s -> $d"
+    mv "$d.tmp" "$d"
     chmod "$m" "$d"
 }
 
@@ -316,6 +371,7 @@ if [ "$ok" = 1 ]; then
     log "  CLI: $BIN/homeproxy"
     log "  Web: http://${lip}:8910/"
     log "  Log: $LOG (tail -f)"
+    DONE=1
     exit 0
 fi
 
@@ -328,4 +384,5 @@ else
     cleanup_volatile
 fi
 log "see log: $LOG"
+DONE=1
 exit 1

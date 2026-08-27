@@ -9,6 +9,10 @@ local _M = {}
 _M.HP_DIR  = "/etc/homeproxy"
 _M.RUN_DIR = "/var/run/homeproxy"
 
+-- Seed math.random so temp-file names are not predictable (H3).
+-- Lua 5.1's default srand is fixed, producing the same sequence every run.
+math.randomseed(os.time())
+
 -- ---------------------------------------------------------------------------
 -- Filesystem helpers
 -- ---------------------------------------------------------------------------
@@ -23,16 +27,20 @@ end
 function _M.writefile(path, content)
     local f = io.open(path, "wb")
     if not f then return false end
-    f:write(content or "")
-    f:close()
+    local ok = f:write(content or "")
+    if not ok then f:close(); return false end
+    ok = f:close()
+    if not ok then return false end
     return true
 end
 
 function _M.appendfile(path, content)
     local f = io.open(path, "ab")
     if not f then return false end
-    f:write(content or "")
-    f:close()
+    local ok = f:write(content or "")
+    if not ok then f:close(); return false end
+    ok = f:close()
+    if not ok then return false end
     return true
 end
 
@@ -72,10 +80,14 @@ function _M.strToInt(str)
 end
 
 -- The upstream ucode implementation appends "s" so numeric seconds become
--- sing-box duration strings ("300" -> "300s").
+-- sing-box duration strings ("300" -> "300s").  Check if the input already
+-- has a sing-box duration unit to avoid double-suffixing (M15: "30m" -> "30ms").
 function _M.strToTime(str)
     if _M.isEmpty(str) then return nil end
-    return tostring(str) .. "s"
+    local s = tostring(str)
+    -- sing-box duration units: s, m, h, d, ms
+    if s:match("[%a]$") then return s end  -- already has a unit
+    return s .. "s"
 end
 
 function _M.split(s, pat)
@@ -125,12 +137,22 @@ local function is_ip6(s)
 end
 
 local function is_hostname(s)
-    if s == "" then return false end
-    if s:match("^[a-zA-Z0-9_]+$") then return true end
-    if s:match("^[a-zA-Z0-9_][a-zA-Z0-9_%-%.]*[a-zA-Z0-9_]$") and s:match("[^0-9%.]") then
-        return true
+    if s == "" or #s > 253 then return false end
+    -- Single-label hostname (no dots): alphanumeric + underscore.
+    if not s:match("%.") then
+        return s:match("^[a-zA-Z0-9_]+$") ~= nil
     end
-    return false
+    -- Multi-label: validate each label per RFC 1123 (M11).
+    for label in s:gmatch("[^.]+") do
+        if #label == 0 or #label > 63 then return false end
+        -- Label must not start or end with hyphen; only alnum + hyphen allowed.
+        if not label:match("^[a-zA-Z0-9][a-zA-Z0-9%-]*[a-zA-Z0-9]$") then
+            -- Allow single-char labels (just alnum).
+            if not label:match("^[a-zA-Z0-9]$") then return false end
+        end
+    end
+    -- Must contain at least one non-numeric label (avoid pure-numeric "123.456").
+    return s:match("[^0-9%.]") ~= nil
 end
 
 function _M.validation(datatype, data)
@@ -290,6 +312,14 @@ local function clean(res)
         end
         if n == 0 then return nil end
         if isarray then
+            -- Verify keys are exactly {1, 2, ..., n} (M2): non-sequential
+            -- numeric keys (e.g. {[0]=... or {[1]=..,[3]=..}) would silently
+            -- lose data if we just iterated 1..n.
+            for i = 1, n do
+                if res[i] == nil then isarray = false; break end
+            end
+        end
+        if isarray then
             for i = 1, n do
                 local v = clean(res[i])
                 if v ~= nil then out[#out + 1] = v end
@@ -347,15 +377,19 @@ function _M.wGET(url, ua)
     -- Stock MiWiFi busybox wget cannot fetch HTTPS; prefer curl for https URLs
     -- and fall back to wget otherwise (or when curl is unavailable).
     if url:match("^https://") then
-        local r = _M.executeCommand("/usr/bin/curl -fsS -m 20 -A " .. qua .. " " .. qurl)
+        local r = _M.executeCommand("/usr/bin/curl -fsSL -m 20 -A " .. qua .. " " .. qurl)
         if not _M.isEmpty(r.stdout) then return _M.trim(r.stdout) end
     end
     local r = _M.executeCommand("/usr/bin/wget -qO- --user-agent " .. qua .. " --timeout=10 " .. qurl)
     return _M.trim(r.stdout)
 end
 
+local _log_dir_created = false
 function _M.log(msg, tag)
-    _M.mkdir_p(_M.RUN_DIR)
+    if not _log_dir_created then
+        _M.mkdir_p(_M.RUN_DIR)
+        _log_dir_created = true
+    end
     _M.appendfile(_M.RUN_DIR .. "/homeproxy.log",
         string.format("%s [%s] %s\n", _M.getTime(), tag or "DAEMON", msg))
 end

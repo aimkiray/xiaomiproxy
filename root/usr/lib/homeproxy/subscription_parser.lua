@@ -20,6 +20,11 @@ local function aslist(hp, v)
 	return #t > 0 and t or nil
 end
 
+-- Consistent boolean flag parsing (M8): real-world links serialise booleans
+-- as "1", "true", or true.  Use this everywhere instead of inconsistent per-
+-- scheme checks.
+local function flag(v) return v == "1" or v == "true" or v == true end
+
 local function apply_ws_early_data(cfg)
 	if not cfg.ws_path then return end
 	local path, ed = cfg.ws_path:match("^(.-)%?ed=(.+)$")
@@ -33,7 +38,10 @@ end
 local function parse_share_url(hp, scheme, rest)
 	local url = hp.parseURL("http://" .. rest)
 	if not url then return nil end
-	local authority = rest:match("^([^?#]*)") or ""
+	-- Stop at '/' so authority matches what parseURL sees (H6: URIs with a
+	-- path before the query would otherwise fail port detection and fall back
+	-- to the scheme default, connecting to the wrong port).
+	local authority = rest:match("^([^?#/]*)") or ""
 	local has_port = authority:match("%]:%d+$") or authority:match("[^:]:%d+$")
 	if not has_port then
 		local defaults = {
@@ -51,7 +59,7 @@ end
 
 local function normalize_node(hp, cfg)
 	if type(cfg) ~= "table" or is_empty(hp, cfg.address) or is_empty(hp, cfg.port) then return nil end
-	if cfg.type == "vmess" and (is_empty(hp, cfg.uuid) or is_empty(hp, cfg.address)) then return nil end
+	if cfg.type == "vmess" and is_empty(hp, cfg.uuid) then return nil end
 	cfg.address = tostring(cfg.address):gsub("[%[%]]", "")
 	local valid_host = hp.validation("ip4addr", cfg.address)
 		or hp.validation("ip6addr", cfg.address)
@@ -131,7 +139,10 @@ local function parse_uri_raw(hp, opts, uri)
 	if scheme == "ss" then return parse_ss(hp, rest) end
 	if scheme == "vmess" then
 		if rest:find("&", 1, true) then log("Skipping unsupported vmess format."); return nil end
-		local raw = hp.decodeBase64Str(rest)
+		-- Strip fragment/query before base64 decode (M7): characters in #tag
+		-- that happen to be base64-valid would corrupt the trailing JSON.
+		local b64 = rest:match("^([^?#]*)") or rest
+		local raw = hp.decodeBase64Str(b64)
 		if is_empty(hp, raw) then return nil end
 		local ok, j = pcall(hp.decode_json, raw)
 		if not ok or type(j) ~= "table" or j.v ~= "2" or is_empty(hp, j.add)
@@ -151,7 +162,7 @@ local function parse_uri_raw(hp, opts, uri)
 			port = tostring(j.port), uuid = j.id, vmess_alterid = tostring(j.aid or 0),
 			vmess_encrypt = j.scy or "auto", vmess_global_padding = "1",
 			transport = (net ~= "tcp") and net or nil,
-			tls = (j.tls == "tls" or j.tls == "1" or j.tls == true) and "1" or "0",
+			tls = (flag(j.tls)) and "1" or "0",
 			tls_sni = j.sni or j.host, tls_alpn = aslist(hp, j.alpn),
 			tls_utls = (features.with_utls and not is_empty(hp, j.fp)) and j.fp or nil,
 			packet_encoding = packet_encoding }
@@ -168,7 +179,7 @@ local function parse_uri_raw(hp, opts, uri)
 	if scheme == "anytls" then
 		return { label = label, type = "anytls", address = url.hostname, port = url.port,
 			password = uridecode_component(url.username), tls = "1", tls_sni = p.sni,
-			tls_alpn = aslist(hp, p.alpn), tls_insecure = (p.insecure == "1") and "1" or "0",
+			tls_alpn = aslist(hp, p.alpn), tls_insecure = flag(p.insecure) and "1" or "0",
 			tls_reality = (p.security == "reality") and "1" or "0",
 			tls_reality_public_key = p.pbk, tls_reality_short_id = p.sid,
 			tls_utls = (features.with_utls and not is_empty(hp, p.fp)) and p.fp or nil }
@@ -184,7 +195,7 @@ local function parse_uri_raw(hp, opts, uri)
 	elseif scheme == "trojan" then
 		local cfg = { label = label, type = "trojan", address = url.hostname, port = url.port,
 			password = uridecode_component(url.username), tls = "1", tls_sni = p.sni,
-			tls_insecure = (p.allowInsecure == "1" or p.insecure == "1") and "1" or "0",
+			tls_insecure = (flag(p.allowInsecure) or flag(p.insecure)) and "1" or "0",
 			tls_alpn = aslist(hp, p.alpn), transport = (p.type and p.type ~= "tcp") and p.type or nil }
 		if p.type == "grpc" then cfg.grpc_servicename = p.serviceName
 		elseif p.type == "ws" then cfg.ws_host, cfg.ws_path = p.host, p.path or "/"; apply_ws_early_data(cfg)
@@ -201,22 +212,22 @@ local function parse_uri_raw(hp, opts, uri)
 			hysteria_protocol = p.protocol or "udp", hysteria_auth_type = p.auth and "string" or nil,
 			hysteria_auth_payload = p.auth, hysteria_obfs_password = p.obfsParam,
 			hysteria_down_mbps = p.downmbps, hysteria_up_mbps = p.upmbps, tls = "1",
-			tls_insecure = (p.insecure == "true" or p.insecure == "1") and "1" or "0",
+			tls_insecure = flag(p.insecure) and "1" or "0",
 			tls_sni = p.peer, tls_alpn = aslist(hp, p.alpn) }
 	elseif scheme == "hysteria2" or scheme == "hy2" then
 		if not features.with_quic then return skip_quic("hysteria2", label, url.hostname) end
 		return { label = label, type = "hysteria2", address = url.hostname, port = url.port,
 			password = url.username and uridecode_component(url.username .. (url.password and (":" .. url.password) or "")) or nil,
 			hysteria_obfs_type = p.obfs, hysteria_obfs_password = p["obfs-password"], tls = "1",
-			tls_sni = p.sni, tls_insecure = (p.insecure == "1") and "1" or "0", tls_alpn = aslist(hp, p.alpn) }
+			tls_sni = p.sni, tls_insecure = flag(p.insecure) and "1" or "0", tls_alpn = aslist(hp, p.alpn) }
 	elseif scheme == "tuic" then
 		if not features.with_quic then return skip_quic("tuic", label, url.hostname) end
 		return { label = label, type = "tuic", address = url.hostname, port = url.port,
 			uuid = uridecode_component(url.username), password = url.password and uridecode_component(url.password) or nil,
 			tls = "1", tls_sni = p.sni, tls_alpn = aslist(hp, p.alpn),
-			tls_insecure = (p.allowInsecure == "1" or p.insecure == "1") and "1" or "0",
+			tls_insecure = (flag(p.allowInsecure) or flag(p.insecure)) and "1" or "0",
 			tuic_congestion_control = p.congestion_control, tuic_udp_relay_mode = p.udp_relay_mode,
-			tuic_enable_zero_rtt = (p.zero_rtt_handshake == "1") and "1" or "0" }
+			tuic_enable_zero_rtt = flag(p.zero_rtt_handshake) and "1" or "0" }
 	elseif scheme == "vless" then
 		if p.type == "kcp" then log(string.format("Skipping unsupported vless node: %s.", tostring(label or url.hostname))); return nil end
 		if p.type == "quic" and ((p.quicSecurity and p.quicSecurity ~= "none") or not features.with_quic) then
@@ -259,7 +270,8 @@ function M.decode_subscription_body(hp, res)
 end
 
 function M.filter_check(hp, name, mode, keywords)
-	if is_empty(hp, name) or mode == "disabled" or #keywords == 0 then return false end
+	if is_empty(hp, name) or mode == "disabled" then return false end
+	if type(keywords) ~= "table" or #keywords == 0 then return false end
 	local matched = false
 	for _, kw in ipairs(keywords) do
 		for term in tostring(kw):gmatch("[^|]+") do

@@ -142,13 +142,26 @@ stop_fw() {
 	for _s in $ALL_IPSETS; do ipset destroy "$_s" 2>/dev/null; done
 }
 
-[ "$1" = "stop" ] && { stop_fw; exit 0; }
-[ "$1" = "restart" ] && stop_fw
+cmd=${1:-}
+[ "$cmd" = "stop" ] && { stop_fw; exit 0; }
+[ "$cmd" = "restart" ] && stop_fw
+case "$cmd" in start|restart) ;;
+*) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
+esac
 
 if [ "$lan_proxy_mode" = "disabled" ]; then
 	echo "homeproxy: LAN proxy disabled; no firewall rules applied." >&2
 	exit 0
 fi
+
+# Validate routing_mode (M18): unknown value silently proxies everything.
+case "$routing_mode" in
+	bypass_mainland_china|proxy_mainland_china|gfwlist|custom) ;;
+	*)
+		echo "homeproxy: invalid routing_mode='$routing_mode' -- aborting." >&2
+		stop_fw; exit 1
+		;;
+esac
 
 mkdir -p "$RUN_DIR"
 
@@ -181,7 +194,14 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
 	[ "$ipv6" = "1" ] && build_ipset homeproxy_cn6 "$RES_DIR/china_ip6.txt" inet6
 	cn_cnt=$(ipset list homeproxy_cn4 2>/dev/null | awk '/Number of entries/{print $4}')
 	[ -z "$cn_cnt" ] && cn_cnt=0
-	[ "$cn_cnt" -le 0 ] && echo "homeproxy: WARNING: CN ipset empty/missing ($RES_DIR/china_ip4.txt) -- $routing_mode will proxy all traffic." >&2
+	[ "$cn_cnt" -le 0 ] && {
+		if [ "$routing_mode" = "bypass_mainland_china" ]; then
+			echo "homeproxy: WARNING: CN ipset empty ($RES_DIR/china_ip4.txt) -- bypass_mainland_china will PROXY ALL traffic." >&2
+		elif [ "$routing_mode" = "proxy_mainland_china" ]; then
+			echo "homeproxy: FATAL: CN ipset empty -- proxy_mainland_china would PROXY NOTHING (all direct). Aborting." >&2
+			stop_fw; exit 1
+		fi
+	}
 	if [ "$ipv6" = "1" ]; then
 		cn6_cnt=$(ipset list homeproxy_cn6 2>/dev/null | awk '/Number of entries/{print $4}')
 		[ -z "$cn6_cnt" ] && cn6_cnt=0
@@ -488,6 +508,11 @@ if [ "$main_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
 	udp_tproxy=1
 fi
 
+# Error tracking wrapper (H7): detect critical iptables failures so the
+# firewall doesn't silently apply a partial rule set.
+hp_fw_err=0
+hp_ipt() { "$@" 2>/dev/null || { hp_fw_err=1; echo "homeproxy: ipt rule failed: $*" >&2; }; }
+
 if echo "$proxy_mode" | grep -q redirect; then
 	apply_tcp "$IP4" "$route_set4"
 	if [ "$ipv6" = "1" ]; then apply_tcp "$IP6" "$route_set6"; fi
@@ -513,6 +538,10 @@ if [ "$dns_redirect" = "1" ] && [ "$dns_hijacked" != "1" ]; then
 	[ "$ipv6" = "1" ] && apply_dns "$IP6" "$dnsmasq_port"
 else
 	echo "homeproxy: DNS redirect skipped (dns_redirect=$dns_redirect dnsmasq_hijacked=$dns_hijacked)." >&2
+fi
+
+if [ -z "$LAN_IFS" ]; then
+	echo "homeproxy: WARNING: no LAN interface found; only router-self traffic will be steered." >&2
 fi
 
 echo "homeproxy: firewall rules applied (mode=$proxy_mode routing=$routing_mode lan=$lan_proxy_mode ifaces=$LAN_IFS)." >&2

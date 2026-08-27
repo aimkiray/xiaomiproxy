@@ -24,6 +24,34 @@ local function isEmpty(v) return hp.isEmpty(v) end
 local function push(t, v) t[#t + 1] = v end
 local function log(msg) hp.log(msg, "SUBSCRIBE") end
 
+-- Concurrency lock: prevent cron + manual update from clobbering each other.
+local lock_path = hp.RUN_DIR .. "/subscribe.lock"
+local lock_f = io.open(lock_path, "w")
+if lock_f then
+  -- O_EXCL-style: if the file already exists from another running instance,
+  -- we don't get an error from io.open("w") (it truncates), so use a pid check.
+  local prev_pid = hp.trim(hp.readfile(lock_path) or "")
+  if prev_pid and prev_pid ~= "" and os.execute("kill -0 " .. hp.shellQuote(prev_pid) .. " 2>/dev/null") == 0 then
+    log("Another subscription update is running (pid=" .. prev_pid .. "), aborting.")
+    os.exit(0)
+  end
+  lock_f:seek("set", 0)
+  lock_f:write(tostring(os.getenv("HP_PID") or ""))
+  -- Use os.time as a fallback pid surrogate if HP_PID is unset.
+  lock_f:write("")
+  lock_f:close()
+  -- Write our process id via a shell call since Lua 5.1 has no getpid().
+  local pf = io.popen("echo $$")
+  if pf then local pid = hp.trim(pf:read("*a") or ""); pf:close()
+    if pid and pid ~= "" then
+      local wf = io.open(lock_path, "w")
+      if wf then wf:write(pid); wf:close() end
+    end
+  end
+else
+  log("WARNING: could not create lock file, proceeding without concurrency protection.")
+end
+
 local allow_insecure    = uci:get(CFG, UCISUB, "allow_insecure") or "0"
 local filter_mode        = uci:get(CFG, UCISUB, "filter_nodes") or "disabled"
 local filter_keywords    = uci:get(CFG, UCISUB, "filter_keywords") or {}
@@ -151,14 +179,16 @@ end
 
 local node_cache, node_result = {}, {}
 
--- Prune gone node names out of a urltest list UCI option; persists the cleaned
--- list and returns (kept count, whether anything was removed).
+-- Prune gone node names out of a urltest list UCI option; returns
+-- (kept count, whether anything was removed).  Does NOT commit — the caller
+-- folds the change into the final atomic commit.
 local function prune_urltest_list(opt)
 	local list = uci:get(CFG, UCIMAIN, opt) or {}
 	if type(list) ~= "table" then list = { list } end
 	local kept, changed = {}, false
 	for _, v in ipairs(list) do
-		if uci:get_all(CFG, v) then
+		local s = uci:get_all(CFG, v)
+		if s and s[".type"] == UCINODE then
 			kept[#kept + 1] = v
 		else
 			changed = true
@@ -167,9 +197,16 @@ local function prune_urltest_list(opt)
 	end
 	if changed then
 		if #kept > 0 then uci:set(CFG, UCIMAIN, opt, kept) else uci:delete(CFG, UCIMAIN, opt) end
-		uci:commit(CFG)
 	end
 	return #kept, changed
+end
+
+-- Checked commit: aborts hard on persistence failure (H5) instead of silently
+-- proceeding with a divergent in-memory/disk state.
+local function commit_uci()
+	if not uci:commit(CFG) then
+		error("uci:commit failed — filesystem may be read-only or full")
+	end
 end
 
 local function main()
@@ -237,7 +274,8 @@ local function main()
 							local lbl = cfg.label
 							cfg.label = nil
 							local confHash = hp.md5(hp.encode_json(cfg))
-							local nameHash = lbl and hp.md5(lbl) or nil
+							-- Use namespaced hash to match the section name scheme (C1 fix).
+							local nameHash = lbl and hp.md5(groupHash .. "\x00" .. lbl) or nil
 							cfg.label = lbl
 							if filter_check(lbl) then
 								log("Skipping filtered node: " .. tostring(lbl))
@@ -292,17 +330,20 @@ local function main()
 			removed = removed + 1
 			log("Removing node: " .. tostring(cfg.label))
 		else
-			for k in pairs(cfg) do
-				if k:sub(1, 1) ~= "." then
-					local new = node_cache[gh][cfg[".name"]][k]
-					if new ~= nil then
-						uci:set(CFG, cfg[".name"], k, new)
-					else
-						uci:delete(CFG, cfg[".name"], k)
-					end
+			local newcfg = node_cache[gh][cfg[".name"]]
+			-- Apply all fields from the new node (handles field additions).
+			for k, v in pairs(newcfg) do
+				if k:sub(1, 1) ~= "." and k ~= "isExisting" then
+					uci:set(CFG, cfg[".name"], k, v)
 				end
 			end
-			node_cache[gh][cfg[".name"]].isExisting = true
+			-- Delete fields present in the old node but absent from the new.
+			for k in pairs(cfg) do
+				if k:sub(1, 1) ~= "." and newcfg[k] == nil then
+					uci:delete(CFG, cfg[".name"], k)
+				end
+			end
+			newcfg.isExisting = true
 		end
 	end)
 
@@ -310,7 +351,10 @@ local function main()
 	for _, nodes in ipairs(node_result) do
 		for _, node in ipairs(nodes) do
 			if not node.isExisting then
-				local nameHash = hp.md5(node.label)
+				-- Namespace section name by groupHash to prevent cross-subscription
+				-- label collisions (C1): two subs with "HK 01" would otherwise
+				-- overwrite each other's UCI section every run.
+				local nameHash = hp.md5(node.grouphash .. "\x00" .. node.label)
 				uci:set(CFG, nameHash, "node")
 				for k, v in pairs(node) do
 					if k ~= "isExisting" then uci:set(CFG, nameHash, k, v) end
@@ -320,7 +364,6 @@ local function main()
 			end
 		end
 	end
-	uci:commit(CFG)
 
 	local need_restart = (via_proxy ~= "1")
 	if not isEmpty(main_node) then
@@ -332,13 +375,11 @@ local function main()
 				if changed then need_restart = true end
 				if n == 0 then
 					uci:set(CFG, UCIMAIN, "main_node", first)
-					uci:commit(CFG)
 					need_restart = true
 					log("Main node is gone, switching to the first node.")
 				end
 			elseif not uci:get_all(CFG, main_node) then
 				uci:set(CFG, UCIMAIN, "main_node", first)
-				uci:commit(CFG)
 				need_restart = true
 				log("Main node is gone, switching to the first node.")
 			end
@@ -348,13 +389,11 @@ local function main()
 					if changed then need_restart = true end
 					if n == 0 then
 						uci:set(CFG, UCIMAIN, "main_udp_node", first)
-						uci:commit(CFG)
 						need_restart = true
 						log("Main UDP node is gone, switching to the first node.")
 					end
 				elseif not uci:get_all(CFG, main_udp_node) then
 					uci:set(CFG, UCIMAIN, "main_udp_node", first)
-					uci:commit(CFG)
 					need_restart = true
 					log("Main UDP node is gone, switching to the first node.")
 				end
@@ -362,11 +401,13 @@ local function main()
 		else
 			uci:set(CFG, UCIMAIN, "main_node", "nil")
 			uci:set(CFG, UCIMAIN, "main_udp_node", "nil")
-			uci:commit(CFG)
 			need_restart = true
 			log("No available node, disable tproxy.")
 		end
 	end
+
+	-- Single atomic commit for all node + main_node + urltest changes (H4).
+	commit_uci()
 
 	if need_restart then
 		log("Restarting service...")
@@ -376,6 +417,8 @@ local function main()
 end
 
 local ok, err = pcall(main)
+-- Always clean up the concurrency lock.
+os.remove(lock_path)
 if not ok then
 	log("[FATAL ERROR] " .. tostring(err))
 	if via_proxy ~= "1" then
