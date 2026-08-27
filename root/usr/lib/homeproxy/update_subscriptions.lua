@@ -25,26 +25,26 @@ local function push(t, v) t[#t + 1] = v end
 local function log(msg) hp.log(msg, "SUBSCRIBE") end
 
 -- Concurrency lock: prevent cron + manual update from clobbering each other.
--- Read-first approach: check for a live PID before truncating the file.
+-- Uses a timestamp-based stale lock: if the lock file is younger than
+-- MAX_LOCK_AGE seconds, another update is likely still running.  Lua 5.1
+-- has no getpid(), so a PID-based lock is unreliable (subshell PIDs die
+-- immediately).  The timestamp approach is simple and sufficient for the
+-- cron-vs-manual use case (updates take < 60s).
 local lock_path = hp.RUN_DIR .. "/subscribe.lock"
+local MAX_LOCK_AGE = 120  -- seconds
 do
-  local prev_pid = hp.trim(hp.readfile(lock_path) or "")
-  if prev_pid and prev_pid ~= "" then
-    -- Check if that process is still alive.
-    if os.execute("kill -0 " .. hp.shellQuote(prev_pid) .. " 2>/dev/null") == 0 then
-      log("Another subscription update is running (pid=" .. prev_pid .. "), aborting.")
+  local lock_time = tonumber(hp.trim(hp.readfile(lock_path) or ""))
+  if lock_time then
+    local age = os.time() - lock_time
+    if age >= 0 and age < MAX_LOCK_AGE then
+      log("Another subscription update is running (started " .. age .. "s ago), aborting.")
       os.exit(0)
     end
   end
-  -- Write our PID into the lock file.  We use a subshell's $$ as a proxy
-  -- for the Lua PID (Lua 5.1 has no getpid).  The lock is advisory — a
-  -- stale PID (from a crashed run) is detected by kill -0 above.
-  local pf = io.popen("echo $$")
-  local pid = pf and hp.trim(pf:read("*a") or "") or ""
-  if pf then pf:close() end
+  -- Write current timestamp as the lock.
   local wf = io.open(lock_path, "w")
   if wf then
-    wf:write(pid)
+    wf:write(tostring(os.time()))
     wf:close()
   else
     log("WARNING: could not create lock file, proceeding without concurrency protection.")

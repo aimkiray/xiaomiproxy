@@ -70,22 +70,25 @@ start_service() {
             fi
             log "Config OK after disabling per-node probe outbounds (ping-all unavailable this run)."
         fi
+    fi
 
-        # Config validated — now safe to mutate routing/firewall state (H9).
-        # Generate + validate server config too, so a server config failure
-        # doesn't leave client routing/tun/cron state half-applied.
-        local server_cfg_ok=1
-        if [ "$server_enabled" = "1" ]; then
-            lua "$HP_LUA_DIR/generate_server.lua" 2>>"$LOG_PATH"
-            if [ ! -e "$RUN_DIR/sing-box-s.json" ]; then
-                log "Error: failed to generate server configuration."
-                return 1
-            elif ! "$PROG" check --config "$RUN_DIR/sing-box-s.json" 2>>"$LOG_PATH"; then
-                log "Error: wrong server configuration detected."
-                return 1
-            fi
+    # Generate + validate server config (H9: both configs must be validated
+    # BEFORE any routing/tun/cron/firewall state mutation so a failure in
+    # either doesn't leave the system half-applied.  Outside the client block
+    # so server-only mode also works.)
+    if [ "$server_enabled" = "1" ]; then
+        lua "$HP_LUA_DIR/generate_server.lua" 2>>"$LOG_PATH"
+        if [ ! -e "$RUN_DIR/sing-box-s.json" ]; then
+            log "Error: failed to generate server configuration."
+            return 1
+        elif ! "$PROG" check --config "$RUN_DIR/sing-box-s.json" 2>>"$LOG_PATH"; then
+            log "Error: wrong server configuration detected."
+            return 1
         fi
+    fi
 
+    # All configs validated — now safe to mutate routing/firewall state (H9).
+    if [ "$outbound_node" != "nil" ]; then
         # auto subscription update
         local auto_update auto_update_time
         config_get_bool auto_update "subscription" "auto_update" "0"
