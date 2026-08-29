@@ -414,7 +414,11 @@ if not isEmpty(main_node) then
             strategy = (ipv6_support ~= "1") and "ipv4_only" or nil },
         detour = "main-out",
     }
-    for k, v in pairs(parse_dnsserver(dns_server, "tcp") or {}) do main_dns[k] = v end
+    -- DoH (HTTPS) instead of plain TCP: HTTP/2 multiplexes queries over a
+    -- single tunnel connection with builtired reconnection, eliminating the
+    -- "read response: EOF" errors when the proxy link's TCP connection is
+    -- closed by any layer (anytls idle reaping, server NAT, carrier).
+    for k, v in pairs(parse_dnsserver(dns_server, "https") or {}) do main_dns[k] = v end
     push(config.dns.servers, main_dns)
     config.dns.final = "main-dns"
 
