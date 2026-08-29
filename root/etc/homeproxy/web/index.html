@@ -112,6 +112,39 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
  </div>
 
  <div class="card">
+  <h2>DNS servers</h2>
+  <div class="row">
+   <label>Proxy DNS</label>
+   <select id="dnsPreset" style="flex:0 0 200px">
+    <option value="">— preset —</option>
+    <option value="8.8.8.8">Google DoH (8.8.8.8)</option>
+    <option value="1.1.1.1">Cloudflare DoH (1.1.1.1)</option>
+    <option value="9.9.9.9">Quad9 DoH (9.9.9.9)</option>
+    <option value="https://dns.adguard-dns.com/dns-query">AdGuard DoH</option>
+    <option value="https://dns.cloudflare.com/dns-query">Cloudflare DoH (host)</option>
+    <option value="https://dns.google/dns-query">Google DoH (host)</option>
+   </select>
+   <input id="proxyDns" placeholder="IP or https://host/dns-query">
+  </div>
+  <div class="row">
+   <label>China DNS</label>
+   <select id="cnDnsPreset" style="flex:0 0 200px">
+    <option value="">— preset —</option>
+    <option value="223.5.5.5">AliDNS (223.5.5.5)</option>
+    <option value="119.29.29.29">DNSPod (119.29.29.29)</option>
+    <option value="114.114.114.114">114DNS (114.114.114.114)</option>
+    <option value="223.6.6.6">AliDNS IPv6-first (223.6.6.6)</option>
+    <option value="180.76.76.76">Baidu DNS (180.76.76.76)</option>
+   </select>
+   <input id="chinaDns" placeholder="IP address (UDP direct)">
+  </div>
+  <div class="row" style="margin-top:8px">
+   <button id="applyDns" class="ghost">Apply</button>
+  </div>
+  <div class="sub" style="margin-top:8px">Proxy DNS = DoH via tunnel (non-CN domains) · China DNS = UDP direct (CN domains). Apply restarts the proxy.</div>
+ </div>
+
+ <div class="card">
   <h2>Actions</h2>
   <div class="opts">
    <button id="btnSub" class="ghost">Update subscription</button>
@@ -179,12 +212,23 @@ async function loadConfig(){
  }catch(e){toast('config: '+e.message)}
  await loadState();
  loadSubUrls();
+ loadDns();
 }
 
 function loadSubUrls(){
  if(!cfg||!cfg.values)return;
  const u=cfg.values.subscription&&cfg.values.subscription.subscription_url;
  $('subUrls').value=u?(Array.isArray(u)?u:[u]).join('\n'):'';
+}
+
+function loadDns(){
+ if(!cfg||!cfg.values)return;
+ const c=cfg.values.config||{};
+ $('proxyDns').value=c.dns_server||'';
+ $('chinaDns').value=c.china_dns_server||'';
+ // Clear presets — user may have typed a custom value
+ $('dnsPreset').value='';
+ $('cnDnsPreset').value='';
 }
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -234,6 +278,10 @@ async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$
 async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
 async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
 async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
+async function applyDns(){
+ if(busy.applyDns)return;setBusy('applyDns',true);
+ const p=$('proxyDns').value,c=$('chinaDns').value;
+ try{const r=await apiJson('set_dns',{method:'POST',body:p+'\n'+c});toast(r.ok?'DNS set, restarting…':'failed: '+(r.error||''));if(r.ok)await refresh()}catch(e){toast('DNS set failed: '+e.message)}finally{setBusy('applyDns',false)}}
 async function doSubscribe(){
  if(busy.btnSub)return;setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
  try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
@@ -260,6 +308,9 @@ $('applyLanProxy').onclick=applyLanProxy;
 $('applyDirect').onclick=applyDirectList;
 $('applyProxy').onclick=applyProxyList;
 $('applySubUrls').onclick=applySubUrls;
+$('applyDns').onclick=applyDns;
+$('dnsPreset').onchange=function(){if(this.value)$('proxyDns').value=this.value};
+$('cnDnsPreset').onchange=function(){if(this.value)$('chinaDns').value=this.value};
 $('btnSub').onclick=doSubscribe;
 $('btnRestart').onclick=doRestart;
 $('btnRefresh').onclick=refresh;

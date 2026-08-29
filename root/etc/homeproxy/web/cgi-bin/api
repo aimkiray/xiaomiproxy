@@ -76,7 +76,7 @@ do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1;
 # Write endpoints require POST -- this is an unauthenticated LAN API, so
 # guard against an accidental GET clearing a list or triggering a restart.
 case "$Q_action" in
-	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|subscribe|restart)
+	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|set_dns|subscribe|restart)
 		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})" ;;
 esac
 
@@ -208,6 +208,44 @@ set_subscription_urls)
 	json_ok "{\"ok\":true,\"count\":$cnt}"
 	;;
 
+set_dns)
+	# Set proxy DNS (DoH) and China DNS servers.
+	# Body: two lines -- proxy_dns on line 1, china_dns on line 2.
+	# proxy_dns: IP or https://host/path (DoH via tunnel)
+	# china_dns:  IP only (UDP, direct)
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"
+	read_body >"$tmp"
+	proxy_dns=$(sed -n '1p' "$tmp" | tr -d '\r')
+	china_dns=$(sed -n '2p' "$tmp" | tr -d '\r')
+	# Trim whitespace
+	proxy_dns=$(printf '%s' "$proxy_dns" | sed 's/^[ \t]*//;s/[ \t]*$//')
+	china_dns=$(printf '%s' "$china_dns" | sed 's/^[ \t]*//;s/[ \t]*$//')
+	rm -f "$tmp"
+	# Validate proxy_dns: must be an IP or https:// URL
+	case "$proxy_dns" in
+		https://*) : ;;
+		"") json_err "proxy DNS is required" ;;
+		*)
+			# Bare IP — validate it looks like an IPv4/IPv6 address
+			case "$proxy_dns" in
+				*:*|*.*.*) : ;;
+				*) json_err "proxy DNS must be an IP or https:// URL (got: $proxy_dns)" ;;
+			esac
+			;;
+	esac
+	# Validate china_dns: must be a plain IP address
+	case "$china_dns" in
+		"") json_err "china DNS is required" ;;
+		*:*|*.*.*) : ;;
+		*) json_err "china DNS must be an IP address (got: $china_dns)" ;;
+	esac
+	uci set $CONF.config.dns_server="$proxy_dns" 2>/dev/null || json_err "uci set failed"
+	uci set $CONF.config.china_dns_server="$china_dns" 2>/dev/null || json_err "uci set failed"
+	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	do_restart
+	json_ok "{\"ok\":true,\"proxy_dns\":\"$(jesc "$proxy_dns")\",\"china_dns\":\"$(jesc "$china_dns")\"}"
+	;;
+
 ping_nodes)
 	# Per-node delay (ms) via the sing-box Clash API (loopback 127.0.0.1:19290).
 	# Requires generate_client.lua experimental.clash_api + a restart. Tests a
@@ -297,7 +335,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls ping_nodes connectivity subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns ping_nodes connectivity subscribe restart log"
 	;;
 
 *)
