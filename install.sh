@@ -36,7 +36,7 @@ LOG=/var/run/homeproxy/homeproxy.log
 
 SINGBOX_VER=1.13.15
 SINGBOX_SHA256=""  # If set, sing-box download is verified against this hash.
-SINGBOX_URL_DEFAULT="https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_VER}/sing-box_${SINGBOX_VER}_linux_arm64.tar.gz"
+SINGBOX_URL_DEFAULT="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-arm64.tar.gz"
 TIMEOUT=${HP_CONFIRM_TIMEOUT:-30}
 
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
