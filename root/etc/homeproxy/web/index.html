@@ -171,7 +171,7 @@ const $=id=>document.getElementById(id);
 let cfg=null,tailTimer=null,stateTimer=null,busy={},refreshing=false,pingResults=null,lastMain=null,lastMode=null,lastLan=null;
 
 function toast(msg,ms=2600){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),ms)}
-async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const r=await fetch(u,{method:opts.method||'GET',body:opts.body});if(!r.ok)throw new Error('HTTP '+r.status);return r.text()}
+async function api(action,opts={}){const u=API+'?action='+action+(opts.q?('&'+opts.q):'');const m=opts.method||'GET';const h={'X-Requested-With':'XMLHttpRequest'};if(m==='POST')h['Content-Type']='application/json';const r=await fetch(u,{method:m,body:opts.body,headers:h});if(!r.ok)throw new Error('HTTP '+r.status);return r.text()}
 async function apiJson(action,opts={}){const t=await api(action,opts);try{return JSON.parse(t)}catch(e){throw new Error('bad json: '+t.slice(0,120))}}
 
 function fmtKV(o){return Object.entries(o).map(([k,v])=>`<div class="kv"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join('')}

@@ -6,13 +6,15 @@
 #
 # Endpoints (action= in the query string; value in the POST body for writes):
 #   state              current settings + running flag + sing-box version
-#   config             raw ubus uci get JSON (full homeproxy config)
+#   config             projected UCI view (whitelisted fields only, no secrets)
 #   set_main_node      body=node        -> set + restart
 #   set_routing_mode   body=mode        -> set + restart
 #   set_lan_proxy     body=mode        -> set control.lan_proxy_mode + restart
 #   get_domain_lists                   -> {direct,proxy} domain lists
 #   set_direct_list   body=domains     -> overwrite direct_list.txt + restart
 #   set_proxy_list   body=domains     -> overwrite proxy_list.txt + restart
+#   set_subscription_urls body=urls    -> replace subscription_url list
+#   set_dns           body=2 lines     -> set dns_server + china_dns_server + restart
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
@@ -47,24 +49,35 @@ jesc() {
 		| awk '{printf "%s%s",sep,$0; sep="\\n"} END{print ""}'
 }
 
-# parse ?action=...&lines=...
+# parse ?action=...&lines=...  (set -f: QUERY_STRING is attacker input --
+# word-splitting it must not also pathname-expand globs)
 Q_action=""; Q_lines="80"
+set -f
 for kv in $(printf '%s' "${QUERY_STRING:-}" | tr '&' ' '); do
 	case "$kv" in
 		action=*) Q_action=${kv#action=} ;;
 		lines=*)  Q_lines=${kv#lines=} ;;
 	esac
 done
+set +f
 case "$Q_lines" in *[!0-9]*) Q_lines=80 ;; esac
 # Cap the log tail: an unbounded lines= is a cheap memory/CPU DoS.
 [ "$Q_lines" -gt 2000 ] 2>/dev/null && Q_lines=2000
 
 # Request bodies (domain lists, subscription URLs) are small; reject anything
 # beyond 256 KiB outright instead of silently truncating a half-written list.
+# The oversize check must run in the MAIN shell (json_err exits the script):
+# read_body is always invoked inside $( ) or a pipeline where exit would only
+# kill the subshell and leak the error text into the body variable.
+require_body_size() {
+	local n="${CONTENT_LENGTH:-0}"
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	[ "$n" -le 262144 ] 2>/dev/null || json_err "request body too large"
+}
 read_body() {
 	local n="${CONTENT_LENGTH:-0}"
-	case "$n" in *[!0-9]*) n=0 ;; esac
-	if [ "$n" -gt 262144 ] 2>/dev/null; then json_err "request body too large"; fi
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	[ "$n" -gt 262144 ] 2>/dev/null && n=262144
 	[ "$n" -gt 0 ] 2>/dev/null && head -c "$n" 2>/dev/null || true
 }
 
@@ -73,7 +86,17 @@ is_ipv6() { case "$1" in *:*) printf '%s' "$1" | grep -qE '^[0-9A-Fa-f:%.]+$' ;;
 # Single-label or dotted hostname; rejects empty labels, leading dots and
 # leading/trailing hyphens inside labels.
 is_hostname() {
-	printf '%s' "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$'
+	printf '%s' "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$' \
+		&& [ ${#1} -le 253 ]
+}
+# loopback / unspecified / link-local / ULA -- never a legitimate upstream
+# or subscription host (DNS via these loops back through dnsmasq/sing-box,
+# and blind router-side fetches of them are pure SSRF surface).
+is_local_addr() {
+	case "$1" in
+		""|0.0.0.0|::|::1|0:0:0:0:0:0:0:1|127.*|169.254.*|[fF][eE]80:*|[fF][cCdD]*) return 0 ;;
+		*) return 1 ;;
+	esac
 }
 
 valid_mode() {
@@ -86,16 +109,22 @@ valid_mode() {
 # restart the PROXY only (the web UI init is separate, so this never kills uhttpd)
 do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1; }
 
-# CSRF hardening for an unauthenticated LAN API. A drive-by request from
-# another web page can only reach us as a CORS "simple" request -- it cannot
-# attach custom headers without a preflight this server never answers.
-# Requiring X-Requested-With on every action therefore blocks cross-site
-# writes AND reads (C8/H1). When an Origin/Referer is present its host must
-# also match the Host header, which additionally defeats DNS-rebinding.
+# CSRF hardening for an unauthenticated LAN API. uhttpd exposes only a fixed
+# header whitelist to CGI (host/origin/referer/user-agent/content-type/
+# content-length) -- X-Requested-With is NOT among them and can never be
+# enforced here. Enforceable checks instead:
+#   1. every action requires an Origin or Referer whose host part matches the
+#      Host header -- a same-origin fetch() always sends Referer, while a
+#      drive-by request carries the attacker's origin (or none at all) and
+#      is rejected. This also rejects requests whose Host the page does not
+#      actually control (drive-by), though a fully-rebound same-origin host
+#      (DNS rebinding) can only be mitigated, not eliminated, without auth.
+#   2. writes additionally require Content-Type: application/json -- a
+#      cross-site "simple" request can only send text/plain or
+#      form-urlencoded without a CORS preflight this server never answers.
 check_origin() {
-	[ "${HTTP_X_REQUESTED_WITH:-}" = "XMLHttpRequest" ] || json_err "missing X-Requested-With header"
 	local oh="${HTTP_ORIGIN:-${HTTP_REFERER:-}}"
-	[ -n "$oh" ] || return 0
+	[ -n "$oh" ] || json_err "Origin or Referer header required"
 	local ohost="${oh#*://}"; ohost="${ohost%%/*}"
 	[ "$ohost" = "${HTTP_HOST:-}" ] || json_err "cross-origin request rejected"
 }
@@ -108,7 +137,11 @@ esac
 # guard against an accidental GET clearing a list or triggering a restart.
 case "$Q_action" in
 	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|set_dns|subscribe|restart)
-		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})" ;;
+		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})"
+		case "${CONTENT_TYPE:-}" in
+			application/json*) : ;;
+			*) json_err "Content-Type: application/json required" ;;
+		esac ;;
 esac
 
 # --- endpoints -------------------------------------------------------------
@@ -140,8 +173,9 @@ config)
 				ipv6_support=1, dns_server=1, china_dns_server=1, routing_port=1 },
 			subscription = { subscription_url=1, update_via_proxy=1, user_agent=1,
 				packet_encoding=1, filter_nodes=1, filter_keywords=1, allow_insecure=1 },
-			control = { lan_proxy_mode=1, proxy_ifaces=1, lan_ip4_proxy_list=1,
-				lan_ip6_proxy_list=1, lan_mac_proxy_list=1 },
+			control = { lan_proxy_mode=1, lan_proxy_ipv4_ips=1, lan_proxy_ipv6_ips=1,
+				lan_proxy_mac_addrs=1, lan_direct_ipv4_ips=1, lan_direct_ipv6_ips=1,
+				lan_direct_mac_addrs=1 },
 			node = { label=1, type=1, grouphash=1 },
 			infra = { mixed_port=1, redirect_port=1, tproxy_port=1, dns_port=1,
 				tun_name=1 },
@@ -165,6 +199,7 @@ config)
 	;;
 
 set_main_node)
+	require_body_size
 	body=$(read_body | tr -d '\r\n')
 	body=${body#node=}
 	case "$body" in
@@ -177,21 +212,23 @@ set_main_node)
 	esac
 	uci set $CONF.config.main_node="$body" 2>/dev/null || json_err "uci set failed"
 	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
-	do_restart
+	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"main_node":"'"$(jesc "$body")"'"}'
 	;;
 
 set_routing_mode)
+	require_body_size
 	body=$(read_body | tr -d '\r\n')
 	body=${body#mode=}
 	valid_mode "$body" || json_err "bad routing_mode: $body"
 	uci set $CONF.config.routing_mode="$body" 2>/dev/null || json_err "uci set failed"
 	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
-	do_restart
+	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"routing_mode":"'"$(jesc "$body")"'"}'
 	;;
 
 set_lan_proxy)
+	require_body_size
 	body=$(read_body | tr -d '\r\n')
 	body=${body#mode=}
 	case "$body" in
@@ -200,7 +237,7 @@ set_lan_proxy)
 	esac
 	uci set $CONF.control.lan_proxy_mode="$body" 2>/dev/null || json_err "uci set failed"
 	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
-	do_restart
+	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"lan_proxy_mode":"'"$(jesc "$body")"'"}'
 	;;
 
@@ -229,11 +266,13 @@ set_direct_list|set_proxy_list)
 	# "."/".."/"a..b"/"-x", which produce dnsmasq directives like server=/./
 	# (redirecting EVERYTHING into the proxy ipset) or make dnsmasq refuse
 	# to start -- killing LAN DNS/DHCP. Empty body still clears the list.
+	require_body_size
 	read_body | tr -d '\r' | awk -v bad="$badf" '
 		function okdom(s,  i,n,a) {
+			if (length(s) > 253) return 0
 			n = split(s, a, ".")
 			for (i = 1; i <= n; i++)
-				if (a[i] !~ /^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$/) return 0
+				if (length(a[i]) > 63 || a[i] !~ /^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$/) return 0
 			return n >= 1
 		}
 		{ sub(/^[ \t\r]+/,""); sub(/[ \t\r]+$/,"") }
@@ -248,7 +287,7 @@ set_direct_list|set_proxy_list)
 	fi
 	rm -f "$badf"
 	mv -f "$tmp" "$RES_DIR/$file" 2>/dev/null || { rm -f "$tmp"; json_err "write failed"; }
-	do_restart
+	do_restart || json_err "list saved but service restart failed"
 	json_ok '{"ok":true,"file":"'"$file"'"}'
 	;;
 
@@ -258,6 +297,7 @@ set_subscription_urls)
 	# does not wipe the existing list.  Must start with http(s):// or
 	# sip008:// — same scheme check as update_subscriptions.lua.
 	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.suburls.$$"
+	require_body_size
 	read_body >"$tmp"
 	bad=""
 	while IFS= read -r line; do
@@ -271,7 +311,8 @@ set_subscription_urls)
 				local_h=${line#*://}; local_h=${local_h%%/*}
 				local_h=${local_h##*@}
 				case "$local_h" in \[*\]*) local_h=${local_h#\[}; local_h=${local_h%%\]*} ;; *) local_h=${local_h%%:*} ;; esac
-				is_ipv4 "$local_h" || is_ipv6 "$local_h" || is_hostname "$local_h" \
+				is_local_addr "$local_h" && bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"
+				{ is_ipv4 "$local_h" || is_ipv6 "$local_h" || is_hostname "$local_h"; } \
 					|| bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"
 				;;
 			*) bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')" ;;
@@ -300,6 +341,7 @@ set_dns)
 	# proxy_dns: IP or https://host/path (DoH via tunnel)
 	# china_dns:  IP only (UDP, direct)
 	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"
+	require_body_size
 	read_body >"$tmp"
 	proxy_dns=$(sed -n '1p' "$tmp" | tr -d '\r')
 	china_dns=$(sed -n '2p' "$tmp" | tr -d '\r')
@@ -316,12 +358,26 @@ set_dns)
 		*://*)
 			proto=${proxy_dns%%://*}
 			case "$proto" in udp|tcp|tls|https|quic|h3) : ;; *) json_err "unsupported DNS protocol: $proto" ;; esac
-			dh=${proxy_dns#*://}; dh=${dh%%/*}
-			case "$dh" in \[*\]*) dh=${dh#\[}; dh=${dh%%\]*} ;; *) dh=${dh%%:*} ;; esac
+			dha=${proxy_dns#*://}; dha=${dha%%/*}
+			# Split host/port: bracketed IPv6 may carry :port after ']';
+			# unbracketed multi-colon is unparseable -> reject.
+			case "$dha" in
+				\[*\]) dh=${dha#\[}; dh=${dh%%\]*}; dport=${dha#*\]}; dport=${dport#:} ;;
+				*:*:*) json_err "IPv6 DNS host must be [bracketed]: $dha" ;;
+				*:*)   dh=${dha%%:*}; dport=${dha##*:} ;;
+				*)     dh=$dha; dport= ;;
+			esac
+			case "$dport" in
+				"") : ;;
+				*[!0-9]*) json_err "bad DNS port: $dport" ;;
+				*) [ "$dport" -ge 1 ] && [ "$dport" -le 65535 ] 2>/dev/null || json_err "bad DNS port: $dport" ;;
+			esac
+			is_local_addr "$dh" && json_err "DNS host must not be loopback/link-local: $dh"
 			is_ipv4 "$dh" || is_ipv6 "$dh" || is_hostname "$dh" \
 				|| json_err "bad DNS host: $dh"
 			;;
 		*)
+			is_local_addr "$proxy_dns" && json_err "DNS server must not be loopback/link-local: $proxy_dns"
 			is_ipv4 "$proxy_dns" || is_ipv6 "$proxy_dns" \
 				|| json_err "proxy DNS must be an IP or proto:// URL (got: $proxy_dns)"
 			;;
@@ -330,13 +386,14 @@ set_dns)
 	case "$china_dns" in
 		"") json_err "china DNS is required" ;;
 		*)
+			is_local_addr "$china_dns" && json_err "china DNS must not be loopback/link-local: $china_dns"
 			is_ipv4 "$china_dns" || is_ipv6 "$china_dns" \
 				|| json_err "china DNS must be an IP address (got: $china_dns)" ;;
 	esac
 	uci set $CONF.config.dns_server="$proxy_dns" 2>/dev/null || json_err "uci set failed"
 	uci set $CONF.config.china_dns_server="$china_dns" 2>/dev/null || json_err "uci set failed"
 	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
-	do_restart
+	do_restart || json_err "config saved but service restart failed"
 	json_ok "{\"ok\":true,\"proxy_dns\":\"$(jesc "$proxy_dns")\",\"china_dns\":\"$(jesc "$china_dns")\"}"
 	;;
 
@@ -363,7 +420,7 @@ ping_nodes)
 		d=$(cat "$tmp/$sect" 2>/dev/null)
 		ms=$(printf '%s' "$d" 2>/dev/null | sed -n 's/.*"delay":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
 		[ -n "$ms" ] || ms=null
-		printf '"%s":%s' "$sect" "$ms"
+		printf '"%s":%s' "$(jesc "$sect")" "$ms"
 	done
 	printf '}}\n'
 	rm -rf "$tmp" 2>/dev/null
@@ -419,7 +476,7 @@ subscribe)
 	;;
 
 restart)
-	do_restart
+	do_restart || json_err "service restart failed"
 	json_ok '{"ok":true,"restarted":true}'
 	;;
 
