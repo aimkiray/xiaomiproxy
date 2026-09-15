@@ -77,16 +77,34 @@ verify_checksum() {
     [ "$actual" = "$_expected" ] || die "checksum mismatch: expected $_expected, got ${actual:-<empty>}"
 }
 
-# Safe tar extraction: validates that no member escapes the target dir (C6).
+# List members of a (possibly gzipped) tar archive, one per line.
+tar_members() {
+    tar -tzf "$1" 2>/dev/null || tar -tf "$1" 2>/dev/null
+}
+
+# Safe tar extraction: validates the member LIST before touching the fs (C6).
+# The old post-extraction `find "$_dest"` could only ever see paths already
+# inside $_dest, so escapes were undetectable -- and symlinks were skipped
+# entirely. Here we reject: absolute names, '..' path components, and every
+# member that is not a regular file or directory (symlink/hardlink/device/
+# fifo), so no entry can point outside $_dest by construction.
 # Usage: safe_extract <tarball> <dest_dir>
 safe_extract() {
     _tar=$1; _dest=$2
-    tar -C "$_dest" -xzf "$_tar" 2>/dev/null || die "extract failed: $_tar"
-    # Verify no extracted path escaped the destination directory.
-    _escaped=$(find "$_dest" -type f 2>/dev/null | while read -r _f; do
-        case "$_f" in "$_dest"/*) ;; *) echo "$_f" ;; esac
-    done)
-    [ -z "$_escaped" ] || die "path traversal detected in archive: $_escaped"
+    _names=$(tar_members "$_tar")
+    [ -n "$_names" ] || die "cannot list archive (not a tar?): $_tar"
+    _bad=$(printf '%s\n' "$_names" | while IFS= read -r _m; do
+        case "$_m" in
+            /*|../*|*/../*|*/..|..) printf '%s\n' "$_m" ;;
+        esac
+    done | head -n 3)
+    [ -z "$_bad" ] || die "unsafe path in archive: $_bad"
+    _links=$(tar -tvzf "$_tar" 2>/dev/null || tar -tvf "$_tar" 2>/dev/null)
+    # awk field 1 is the mode string: '-' regular file, 'd' dir are the only
+    # member types this installer ships or accepts.
+    _bad=$(printf '%s\n' "$_links" | awk '{c=substr($1,1,1)} c!="-" && c!="d" {print; n++} n>=3{exit}')
+    [ -z "$_bad" ] || die "unsupported member type in archive (links/devices not allowed): $_bad"
+    tar -C "$_dest" -xzf "$_tar" 2>/dev/null || tar -C "$_dest" -xf "$_tar" 2>/dev/null || die "extract failed: $_tar"
 }
 
 # -- args --------------------------------------------------------------------
@@ -222,9 +240,20 @@ EOF
 mv "$BACKUP_META.tmp" "$BACKUP_META"
 log "backup saved: $BACKUP_TAR"
 
-# -- sing-box (download if missing) -----------------------------------------
+# -- sing-box (install missing / upgrade to the pinned version) --------------
+sb_want=0
+sb_cur=""
 if [ ! -x "$SINGBOX" ]; then
-    log "sing-box not found at $SINGBOX -- downloading v${SINGBOX_VER}..."
+    sb_want=1
+elif [ -n "${HP_SINGBOX_URL:-}" ]; then
+    sb_want=1   # explicit URL -> always (re)install
+else
+    # "sing-box version" first line: "sing-box version 1.13.15"
+    sb_cur=$("$SINGBOX" version 2>/dev/null | sed -n 's/^sing-box version //p' | head -n1)
+    [ -n "$sb_cur" ] && [ "$sb_cur" != "$SINGBOX_VER" ] && sb_want=1
+fi
+if [ "$sb_want" = 1 ]; then
+    log "installing sing-box v${SINGBOX_VER} (current: ${sb_cur:-none})..."
     mkdir -p "$SINGBOX_DIR" /tmp/hp_sb
     url=${HP_SINGBOX_URL:-$SINGBOX_URL_DEFAULT}
     fetch "$url" /tmp/hp_sb/sb.tar.gz
@@ -232,7 +261,8 @@ if [ ! -x "$SINGBOX" ]; then
     safe_extract /tmp/hp_sb/sb.tar.gz /tmp/hp_sb
     sb=$(find /tmp/hp_sb -type f -name sing-box | head -n1)
     [ -n "$sb" ] || die "sing-box binary not found in archive"
-    mv "$sb" "$SINGBOX"; chmod 755 "$SINGBOX"
+    # mv over the old binary is atomic; a running sing-box keeps its inode.
+    mv -f "$sb" "$SINGBOX"; chmod 755 "$SINGBOX"
     rm -rf /tmp/hp_sb
     log "sing-box installed: $SINGBOX"
 fi
@@ -252,8 +282,12 @@ case "$SRC" in
     *)
         if [ -d "$SRC" ]; then
             cp -a "$SRC"/. "$WORK"/
+            # A local directory can still contain links pointing outside the
+            # tree -- reject them rather than trusting the path.
+            _l=$(find "$WORK" -type l 2>/dev/null | head -n 1)
+            [ -z "$_l" ] || die "source dir contains a symlink, refusing: $_l"
         elif [ -f "$SRC" ]; then
-            tar -C "$WORK" -xzf "$SRC" 2>/dev/null || tar -C "$WORK" -xf "$SRC" 2>/dev/null || die "extract failed: $SRC"
+            safe_extract "$SRC" "$WORK"
         else
             die "source not found: $SRC"
         fi
@@ -280,6 +314,7 @@ HP_LIB_DIR=$LIB
 HP_RES_DIR=$RES
 HP_BIN_DIR=$BIN
 HP_SINGBOX=$SINGBOX
+HP_WEBUI_PORT=${HP_WEBUI_PORT:-8910}
 EOF
 mv "$HP_BASE/env.sh.tmp" "$HP_BASE/env.sh"
 chmod 644 "$HP_BASE/env.sh"
@@ -290,6 +325,9 @@ install_file() {  # <src> <dst> <mode> <policy: always|if_missing>
     if [ "$pol" = "if_missing" ] && [ -e "$d" ] && [ -z "$FORCE_CONFIG" ]; then
         log "  skip $d (exists)"; return 0
     fi
+    # Never install a symlink as-is: cp -a would copy the link and the
+    # following chmod would then apply to the link TARGET.
+    [ ! -L "$s" ] || die "refusing symlink source: $s"
     mkdir -p "$(dirname "$d")"
     # Atomic write: copy to temp then rename (H15) — prevents partial files
     # if interrupted (e.g. SIGPIPE from curl|sh mid-copy).

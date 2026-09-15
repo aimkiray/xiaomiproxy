@@ -12,4 +12,8 @@ for i in "china_ip4" "china_ip6" "gfw_list" "china_list"; do
     "$SCRIPTS_DIR"/update_resources.sh "$i"
 done
 
+# Node-name migration must run before the updater: after a package upgrade
+# the UCI may still carry old-style section names which the updater would
+# treat as foreign and rebuild (losing the selected main_node).
+lua "$LUA_DIR/migrate_config.lua" 2>/dev/null
 lua "$LUA_DIR/update_subscriptions.lua"

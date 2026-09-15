@@ -61,15 +61,10 @@ export root="${IPKG_INSTROOT}"
 export pkgname="'"$PKG_NAME"'"
 add_group_and_user
 default_postinst
-[ -n "${IPKG_INSTROOT}" ] || { rm -f /tmp/luci-indexcache.*
-	rm -rf /tmp/luci-modulecache/
-	killall -HUP rpcd 2>/dev/null
-	exit 0
-}' > "$TEMP_DIR/post-install"
+exit 0' > "$TEMP_DIR/post-install"
 
 	echo -e '#!/bin/sh
 export PKG_UPGRADE=1
-#!/bin/sh
 [ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
 [ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
 . ${IPKG_INSTROOT}/lib/functions.sh
@@ -77,11 +72,7 @@ export root="${IPKG_INSTROOT}"
 export pkgname="'"$PKG_NAME"'"
 add_group_and_user
 default_postinst
-[ -n "${IPKG_INSTROOT}" ] || { rm -f /tmp/luci-indexcache.*
-	rm -rf /tmp/luci-modulecache/
-	killall -HUP rpcd 2>/dev/null
-	exit 0
-}' > "$TEMP_DIR/post-upgrade"
+exit 0' > "$TEMP_DIR/post-upgrade"
 
 	echo -e '#!/bin/sh
 [ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
@@ -102,7 +93,7 @@ default_prerm' > "$TEMP_DIR/pre-deinstall"
 		--script "post-install:$TEMP_DIR/post-install" \
 		--script "post-upgrade:$TEMP_DIR/post-upgrade" \
 		--script "pre-deinstall:$TEMP_DIR/pre-deinstall" \
-		--info "depends:libc sing-box lua iptables iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-ipset kmod-ipt-ipset ipset" \
+		--info "depends:libc sing-box lua libuci-lua luci-lib-jsonc iptables iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-ipset kmod-ipt-ipset iptables-mod-conntrack kmod-ipt-conntrack iptables-mod-multiport kmod-ipt-multiport iptables-mod-extra kmod-ipt-extra ipset curl firewall uhttpd" \
 		--files "$TEMP_PKG_DIR" \
 		--output "$TEMP_DIR/${PKG_NAME}_${PKG_VERSION}.apk"
 
@@ -113,7 +104,7 @@ else
 	cat > "$TEMP_PKG_DIR/CONTROL/control" <<-EOF
 		Package: $PKG_NAME
 		Version: $PKG_VERSION
-		Depends: libc, sing-box, lua, iptables, iptables-mod-tproxy, kmod-ipt-tproxy, iptables-mod-ipset, kmod-ipt-ipset, ipset
+		Depends: libc, sing-box, lua, libuci-lua, luci-lib-jsonc, iptables, iptables-mod-tproxy, kmod-ipt-tproxy, iptables-mod-ipset, kmod-ipt-ipset, iptables-mod-conntrack, kmod-ipt-conntrack, iptables-mod-multiport, kmod-ipt-multiport, iptables-mod-extra, kmod-ipt-extra, ipset, curl, firewall, uhttpd
 		Source: https://github.com/immortalwrt/homeproxy
 		SourceName: $PKG_NAME
 		Section: net
@@ -136,8 +127,6 @@ default_postinst $0 $@' > "$TEMP_PKG_DIR/CONTROL/postinst"
 
 	echo -e "[ -n "\${IPKG_INSTROOT}" ] || {
 	(. /etc/uci-defaults/$PKG_NAME) && rm -f /etc/uci-defaults/$PKG_NAME
-	rm -f /tmp/luci-indexcache
-	rm -rf /tmp/luci-modulecache/
 	exit 0
 }" > "$TEMP_PKG_DIR/CONTROL/postinst-pkg"
 	chmod 0755 "$TEMP_PKG_DIR/CONTROL/postinst-pkg"

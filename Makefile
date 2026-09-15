@@ -26,6 +26,8 @@ define Package/homeproxy
   DEPENDS:= \
 	+sing-box \
 	+lua \
+	+libuci-lua \
+	+luci-lib-jsonc \
 	+iptables \
 	+iptables-mod-tproxy \
 	+kmod-ipt-tproxy \
@@ -39,7 +41,8 @@ define Package/homeproxy
 	+kmod-ipt-extra \
 	+ipset \
 	+curl \
-	+firewall
+	+firewall \
+	+uhttpd
 endef
 
 define Package/homeproxy/description
@@ -51,8 +54,6 @@ endef
 
 define Package/homeproxy/conffiles
 /etc/config/homeproxy
-/etc/homeproxy/certs/
-/etc/homeproxy/ruleset/
 /etc/homeproxy/resources/direct_list.txt
 /etc/homeproxy/resources/proxy_list.txt
 endef
@@ -69,15 +70,20 @@ endef
 define Package/homeproxy/install
 	$(INSTALL_DIR) $(1)
 	cp -fpR ./root/* $(1)/
-	$(INSTALL_DIR) $(1)/usr/lib/homeproxy $(1)/etc/homeproxy/scripts $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/usr/lib/homeproxy $(1)/etc/homeproxy/scripts \
+		$(1)/etc/init.d $(1)/etc/homeproxy/web/cgi-bin
 	$(INSTALL_BIN) ./root/etc/init.d/homeproxy $(1)/etc/init.d/homeproxy
+	$(INSTALL_BIN) ./root/etc/init.d/homeproxy-web $(1)/etc/init.d/homeproxy-web
 	$(INSTALL_BIN) ./root/usr/bin/homeproxy $(1)/usr/bin/homeproxy
 	$(INSTALL_BIN) ./root/usr/lib/homeproxy/firewall.sh $(1)/usr/lib/homeproxy/firewall.sh
+	$(INSTALL_BIN) ./root/usr/lib/homeproxy/firewall_include.sh $(1)/usr/lib/homeproxy/firewall_include.sh
+	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/boot_restore.sh $(1)/etc/homeproxy/scripts/boot_restore.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/clean_log.sh $(1)/etc/homeproxy/scripts/clean_log.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/update_crond.sh $(1)/etc/homeproxy/scripts/update_crond.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/update_resources.sh $(1)/etc/homeproxy/scripts/update_resources.sh
+	$(INSTALL_BIN) ./root/etc/homeproxy/web/cgi-bin/api $(1)/etc/homeproxy/web/cgi-bin/api
 	$(INSTALL_DATA) ./root/usr/lib/homeproxy/*.lua $(1)/usr/lib/homeproxy/
-	$(INSTALL_BIN) ./root/etc/uci-defaults/luci-homeproxy-migration $(1)/etc/uci-defaults/luci-homeproxy-migration
+	$(INSTALL_BIN) ./root/etc/uci-defaults/homeproxy $(1)/etc/uci-defaults/homeproxy
 endef
 
 include $(TOPDIR)/include/package.mk

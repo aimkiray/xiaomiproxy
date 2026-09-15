@@ -13,11 +13,33 @@ RUN_DIR="/var/run/$NAME"
 LOG_PATH="$RUN_DIR/$NAME.log"
 mkdir -p "$RUN_DIR"
 
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh
+HP_LIB_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
+
 log() {
     echo -e "$(date "+%Y-%m-%d %H:%M:%S") $*" >> "$LOG_PATH"
 }
 
 to_upper() { echo -e "$1" | tr "[a-z]" "[A-Z]"; }
+
+# HTTPS fetch. MiWiFi's busybox wget cannot do TLS (H8) -- prefer curl, which
+# the installer pulls in; fall back to wget for standard OpenWrt builds.
+fetch_url() {
+    # $1=url [$2=extra header]
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "${2:-}" ]; then
+            curl -fsSL --connect-timeout 10 --max-time 60 -H "$2" "$1" 2>/dev/null
+        else
+            curl -fsSL --connect-timeout 10 --max-time 60 "$1" 2>/dev/null
+        fi
+    else
+        if [ -n "${2:-}" ]; then
+            wget --timeout=30 -q --header="$2" -O- "$1" 2>/dev/null
+        else
+            wget --timeout=30 -q -O- "$1" 2>/dev/null
+        fi
+    fi
+}
 
 # parse GitHub commits API json with the on-device lua + luci.json
 parse_verinfo() {
@@ -36,8 +58,12 @@ check_list_update() {
     local listref="$3"
     local listname="$4"
     local lock="$RUN_DIR/update_resources-$listtype.lock"
-    local github_token github_token_arg
+    local github_token auth_hdr
     github_token="$(uci -q get homeproxy.config.github_token)"
+    # Quoting matters: the old code word-split an unquoted --header= arg, so
+    # the token never actually reached GitHub. Pass the header as one arg.
+    auth_hdr=""
+    [ -z "$github_token" ] || auth_hdr="Authorization: Bearer $github_token"
 
     if command -v flock >/dev/null 2>&1; then
         exec 200>"$lock"
@@ -47,11 +73,8 @@ check_list_update() {
         fi
     fi
 
-    github_token_arg=""
-    [ -z "$github_token" ] || github_token_arg="--header=Authorization: Bearer $github_token"
-
     local list_info
-    list_info="$(wget --timeout=10 -q $github_token_arg -O- "https://api.github.com/repos/$listrepo/commits?sha=$listref&path=$listname&per_page=1" 2>/dev/null)"
+    list_info="$(fetch_url "https://api.github.com/repos/$listrepo/commits?sha=$listref&path=$listname&per_page=1" "$auth_hdr")"
     [ -n "$list_info" ] || list_info="[]"
     printf '%s' "$list_info" | parse_verinfo > "$RUN_DIR/.verinfo_$listtype"
     local list_sha list_ver
@@ -71,15 +94,26 @@ check_list_update() {
     fi
     log "[$(to_upper "$listtype")] Local version: $local_list_ver, latest: $list_ver."
 
-    if ! wget --timeout=10 -q "https://fastly.jsdelivr.net/gh/$listrepo@$list_sha/$listname" -O "$RUN_DIR/$listname" || [ ! -s "$RUN_DIR/$listname" ]; then
+    if ! fetch_url "https://fastly.jsdelivr.net/gh/$listrepo@$list_sha/$listname" > "$RUN_DIR/$listname" || [ ! -s "$RUN_DIR/$listname" ]; then
         rm -f "$RUN_DIR/$listname"
         log "[$(to_upper "$listtype")] Update failed."
         return 1
     fi
 
     mv -f "$RUN_DIR/$listname" "$RESOURCES_DIR/$listtype.${listname##*.}"
-    echo -e "$list_ver" > "$RESOURCES_DIR/$listtype.ver"
+    # Atomic .ver write (same-dir tmp + mv) so a crash never leaves a
+    # half-written version file behind.
+    printf '%s\n' "$list_ver" > "$RESOURCES_DIR/.$listtype.ver.tmp" && \
+        mv -f "$RESOURCES_DIR/.$listtype.ver.tmp" "$RESOURCES_DIR/$listtype.ver"
     log "[$(to_upper "$listtype")] Successfully updated."
+
+    # The new list only takes effect after ipsets and the dnsmasq steering
+    # confs are rebuilt; both happen inside a service restart. Only restart
+    # when the proxy is actually running.
+    if pgrep -f "sing-box run --config" >/dev/null 2>&1; then
+        /etc/init.d/"$NAME" restart >/dev/null 2>&1 && \
+            log "[$(to_upper "$listtype")] Service restarted to apply new resources."
+    fi
     return 0
 }
 

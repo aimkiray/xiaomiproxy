@@ -6,8 +6,6 @@ on:
       - 'master'
       - 'dev'
     paths:
-      - 'htdocs/**'
-      - 'po/**'
       - 'root/**'
       - 'Makefile'
       - '.github/**'
@@ -22,7 +20,6 @@ on:
       - synchronize
       - reopened
     paths:
-      - 'htdocs/**'
       - 'root/**'
       - 'Makefile'
       - '.github/**'
@@ -48,13 +45,6 @@ jobs:
           fetch-depth: 0
           ref: 'b5a31c0d865342ad80be10d68f1bb3d3ad9b0866'
 
-      - name: Checkout po2lmo
-        uses: actions/checkout@v6
-        with:
-          repository: 'openwrt/luci'
-          path: 'po2lmo'
-          sparse-checkout: 'modules/luci-base/src'
-
       - name: Setup dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -78,11 +68,6 @@ jobs:
             -Dcrypto_backend=openssl
           ninja -C build
           sudo -E meson install -C build --strip
-          popd
-
-          pushd po2lmo/modules/luci-base/src
-          make po2lmo
-          sudo -E install -m0755 -s po2lmo /usr/local/bin/po2lmo
           popd
 
           curl -fLO "https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build"
@@ -118,6 +103,6 @@ jobs:
         if: github.event_name == 'release'
         with:
           repo_token: ${{ github.token }}
-          file: .github/luci-app-homeproxy_*.*
+          file: .github/homeproxy_*.*
           file_glob: true
           tag: ${{ github.ref }}
