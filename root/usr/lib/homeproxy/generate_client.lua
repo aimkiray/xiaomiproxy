@@ -556,7 +556,7 @@ if tproxy_port then
     -- TPROXYs TCP here as well; in redirect_tproxy TCP goes to redirect-in
     -- and the tcp side of this listener simply stays unused.
     push(config.inbounds, { type = "tproxy", tag = "tproxy-in", listen = "::",
-        listen_port = tonumber(tproxy_port), network = "tcp,udp",
+        listen_port = tonumber(tproxy_port), network = { "tcp", "udp" },
         udp_timeout = strToTime(udp_timeout) })
 end
 if proxy_mode:find("tun") then
