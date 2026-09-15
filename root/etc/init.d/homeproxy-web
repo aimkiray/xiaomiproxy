@@ -15,6 +15,9 @@ STOP=12
 CONF="homeproxy"
 HP_DIR="/etc/homeproxy"
 WEB_DIR="$HP_DIR/web"
+# env.sh carries MiWiFi persistent-path overrides (incl. HP_WEBUI_PORT) on
+# installs laid down by install.sh; absent on a standard package install.
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh
 PORT="${HP_WEBUI_PORT:-8910}"
 
 LOG_PATH="/var/run/homeproxy/homeproxy.log"

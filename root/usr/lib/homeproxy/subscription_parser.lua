@@ -14,16 +14,31 @@ end
 
 local function aslist(hp, v)
 	if is_empty(hp, v) then return nil end
-	if type(v) == "table" then return v end
+	-- Only accept array-like tables: a JSON object (e.g. alpn:{...}) would
+	-- leak into generated config verbatim.
+	if type(v) == "table" then return (v[1] ~= nil) and v or nil end
 	local t = {}
 	for part in tostring(v):gmatch("[^,]+") do t[#t + 1] = part end
 	return #t > 0 and t or nil
 end
 
+-- Coerce a JSON scalar to string; tables/functions become nil so malformed
+-- provider data can never crash string functions downstream.
+local function jstr(v)
+	if type(v) == "string" then return v end
+	if type(v) == "number" then return tostring(v) end
+	return nil
+end
+
 -- Consistent boolean flag parsing (M8): real-world links serialise booleans
 -- as "1", "true", or true.  Use this everywhere instead of inconsistent per-
 -- scheme checks.
-local function flag(v) return v == "1" or v == "true" or v == true end
+local function flag(v) return v == "1" or v == "true" or v == true or v == 1 end
+
+-- Transports sing-box actually supports for outbound nodes (V2Ray transport
+-- layer). Anything else (kcp, xhttp, ...) must be rejected, otherwise the
+-- value is passed through and `sing-box check` rejects the whole config.
+local KNOWN_TRANSPORTS = { ws = true, http = true, grpc = true, httpupgrade = true, quic = true }
 
 local function apply_ws_early_data(cfg)
 	if not cfg.ws_path then return end
@@ -59,7 +74,12 @@ end
 
 local function normalize_node(hp, cfg)
 	if type(cfg) ~= "table" or is_empty(hp, cfg.address) or is_empty(hp, cfg.port) then return nil end
-	if cfg.type == "vmess" and is_empty(hp, cfg.uuid) then return nil end
+	-- Required credentials per protocol: a node without them generates an
+	-- outbound sing-box refuses to load.
+	if (cfg.type == "vmess" or cfg.type == "vless" or cfg.type == "tuic") and is_empty(hp, cfg.uuid) then return nil end
+	if (cfg.type == "trojan" or cfg.type == "anytls" or cfg.type == "hysteria2") and is_empty(hp, cfg.password) then return nil end
+	if cfg.type == "tuic" and is_empty(hp, cfg.password) then return nil end
+	if cfg.type == "shadowsocks" and (is_empty(hp, cfg.shadowsocks_encrypt_method) or is_empty(hp, cfg.password)) then return nil end
 	cfg.address = tostring(cfg.address):gsub("[%[%]]", "")
 	local valid_host = hp.validation("ip4addr", cfg.address)
 		or hp.validation("ip6addr", cfg.address)
@@ -126,10 +146,13 @@ local function parse_uri_raw(hp, opts, uri)
 	end
 	if type(uri) == "table" then
 		if uri.nodetype ~= "sip008" then return nil end
-		return { label = uri.remarks, type = "shadowsocks", address = uri.server,
+		-- Coerce every field: a malformed SIP008 server object (remarks as a
+		-- number, etc.) must not crash string functions or leak non-strings
+		-- into the generated config.
+		return { label = jstr(uri.remarks), type = "shadowsocks", address = jstr(uri.server),
 			port = uri.server_port and tostring(uri.server_port),
-			shadowsocks_encrypt_method = uri.method, password = uri.password,
-			shadowsocks_plugin = uri.plugin, shadowsocks_plugin_opts = uri.plugin_opts }
+			shadowsocks_encrypt_method = jstr(uri.method), password = jstr(uri.password),
+			shadowsocks_plugin = jstr(uri.plugin), shadowsocks_plugin_opts = jstr(uri.plugin_opts) }
 	end
 	if type(uri) ~= "string" then return nil end
 	uri = uri:gsub("^%s+", ""):gsub("%s+$", "")
@@ -145,12 +168,13 @@ local function parse_uri_raw(hp, opts, uri)
 		local raw = hp.decodeBase64Str(b64)
 		if is_empty(hp, raw) then return nil end
 		local ok, j = pcall(hp.decode_json, raw)
-		if not ok or type(j) ~= "table" or j.v ~= "2" or is_empty(hp, j.add)
+		-- v2rayN exports "v" as a JSON number; some providers use "2".
+		if not ok or type(j) ~= "table" or (j.v ~= "2" and j.v ~= 2) or is_empty(hp, j.add)
 			or is_empty(hp, j.port) or is_empty(hp, j.id) then
 			log("Skipping unsupported vmess format."); return nil
 		end
-		local net = j.net or "tcp"
-		local nm = j.ps or j.add
+		local net = jstr(j.net) or "tcp"
+		local nm = jstr(j.ps) or jstr(j.add)
 		if net == "kcp" then
 			log(string.format("Skipping unsupported vmess node: %s.", tostring(nm))); return nil
 		elseif net == "quic" and ((j.type and j.type ~= "none") or j.path or not features.with_quic) then
@@ -158,19 +182,23 @@ local function parse_uri_raw(hp, opts, uri)
 			if not features.with_quic then log("Please rebuild sing-box with QUIC support!") end
 			return nil
 		end
-		local cfg = { label = j.ps and hp.urldecode(j.ps) or nil, type = "vmess", address = j.add,
-			port = tostring(j.port), uuid = j.id, vmess_alterid = tostring(j.aid or 0),
-			vmess_encrypt = j.scy or "auto", vmess_global_padding = "1",
+		local cfg = { label = jstr(j.ps) and hp.urldecode(jstr(j.ps)) or nil, type = "vmess", address = jstr(j.add),
+			port = tostring(j.port), uuid = jstr(j.id), vmess_alterid = tostring(tonumber(j.aid) or 0),
+			vmess_encrypt = jstr(j.scy) or "auto", vmess_global_padding = "1",
 			transport = (net ~= "tcp") and net or nil,
-			tls = (flag(j.tls)) and "1" or "0",
-			tls_sni = j.sni or j.host, tls_alpn = aslist(hp, j.alpn),
-			tls_utls = (features.with_utls and not is_empty(hp, j.fp)) and j.fp or nil,
+			tls = (j.tls == "tls" or flag(j.tls)) and "1" or "0",
+			tls_sni = jstr(j.sni) or jstr(j.host), tls_alpn = aslist(hp, j.alpn),
+			tls_utls = (features.with_utls and not is_empty(hp, j.fp)) and jstr(j.fp) or nil,
 			packet_encoding = packet_encoding }
 		if net == "h2" or (net == "tcp" and j.type == "http") then
-			cfg.transport, cfg.http_host, cfg.http_path = "http", aslist(hp, j.host), j.path
-		elseif net == "grpc" then cfg.grpc_servicename = j.path
-		elseif net == "httpupgrade" then cfg.httpupgrade_host, cfg.http_path = j.host, j.path
-		elseif net == "ws" then cfg.ws_host, cfg.ws_path = j.host, j.path or "/"; apply_ws_early_data(cfg) end
+			cfg.transport, cfg.http_host, cfg.http_path = "http", aslist(hp, j.host), jstr(j.path)
+		elseif net == "grpc" then cfg.grpc_servicename = jstr(j.path)
+		elseif net == "httpupgrade" then cfg.httpupgrade_host, cfg.http_path = jstr(j.host), jstr(j.path)
+		elseif net == "ws" then cfg.ws_host, cfg.ws_path = jstr(j.host), jstr(j.path) or "/"; apply_ws_early_data(cfg) end
+		if cfg.transport and not KNOWN_TRANSPORTS[cfg.transport] then
+			log(string.format("Skipping vmess node with unsupported transport %s: %s.", cfg.transport, tostring(nm)))
+			return nil
+		end
 		return cfg
 	end
 	local url = parse_share_url(hp, scheme, rest)
@@ -193,13 +221,24 @@ local function parse_uri_raw(hp, opts, uri)
 			address = url.hostname, port = url.port, username = url.username and uridecode_component(url.username) or nil,
 			password = url.password and uridecode_component(url.password) or nil }
 	elseif scheme == "trojan" then
+		-- quic transport needs the same feature gate vmess/vless have: on a
+		-- QUIC-less sing-box the node would emit transport{type="quic"} and
+		-- fail `sing-box check`.
+		if p.type == "quic" and not features.with_quic then
+			return skip_quic("trojan", label, url.hostname)
+		end
 		local cfg = { label = label, type = "trojan", address = url.hostname, port = url.port,
 			password = uridecode_component(url.username), tls = "1", tls_sni = p.sni,
 			tls_insecure = (flag(p.allowInsecure) or flag(p.insecure)) and "1" or "0",
 			tls_alpn = aslist(hp, p.alpn), transport = (p.type and p.type ~= "tcp") and p.type or nil }
 		if p.type == "grpc" then cfg.grpc_servicename = p.serviceName
 		elseif p.type == "ws" then cfg.ws_host, cfg.ws_path = p.host, p.path or "/"; apply_ws_early_data(cfg)
-		elseif p.type == "http" then cfg.http_host, cfg.http_path = aslist(hp, p.host), p.path end
+		elseif p.type == "http" then cfg.http_host, cfg.http_path = aslist(hp, p.host), p.path
+		elseif p.type == "httpupgrade" then cfg.httpupgrade_host, cfg.http_path = p.host, p.path end
+		if cfg.transport and not KNOWN_TRANSPORTS[cfg.transport] then
+			log(string.format("Skipping trojan node with unsupported transport %s: %s.", cfg.transport, tostring(label or url.hostname)))
+			return nil
+		end
 		return cfg
 	elseif scheme == "hysteria" then
 		if not features.with_hysteria or (p.protocol and p.protocol ~= "udp") then
@@ -243,9 +282,16 @@ local function parse_uri_raw(hp, opts, uri)
 			tls_utls = (features.with_utls and not is_empty(hp, p.fp)) and p.fp or nil,
 			vless_flow = (sec == "tls" or sec == "reality") and p.flow or nil, packet_encoding = packet_encoding }
 		if p.type == "grpc" then cfg.grpc_servicename = p.serviceName
-		elseif p.type == "http" or (p.type == "tcp" and p.headerType == "http") then cfg.http_host, cfg.http_path = aslist(hp, p.host), p.path
+		elseif p.type == "http" or (p.type == "tcp" and p.headerType == "http") then
+			-- headerType=http camouflage: the transport must be set to http or
+			-- the host/path fields would be silently dropped by the generator.
+			cfg.transport, cfg.http_host, cfg.http_path = "http", aslist(hp, p.host), p.path
 		elseif p.type == "httpupgrade" then cfg.httpupgrade_host, cfg.http_path = p.host, p.path
 		elseif p.type == "ws" then cfg.ws_host, cfg.ws_path = p.host, p.path or "/"; apply_ws_early_data(cfg) end
+		if cfg.transport and not KNOWN_TRANSPORTS[cfg.transport] then
+			log(string.format("Skipping vless node with unsupported transport %s: %s.", cfg.transport, tostring(label or url.hostname)))
+			return nil
+		end
 		return cfg
 	end
 	return nil

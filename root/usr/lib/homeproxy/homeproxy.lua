@@ -76,6 +76,9 @@ end
 function _M.strToInt(str)
     if _M.isEmpty(str) then return nil end
     local n = tonumber(tostring(str))
+    -- Integer only: a float like "80.5" would otherwise be emitted verbatim
+    -- into port/mtu fields that sing-box requires to be integers.
+    if not n or n ~= math.floor(n) then return nil end
     return n
 end
 
@@ -140,9 +143,17 @@ end
 
 local function is_hostname(s)
     if s == "" or #s > 253 then return false end
-    -- Single-label hostname (no dots): alphanumeric + underscore.
+    -- Reject empty labels: leading/trailing dot or "a..b" (gmatch("[^.]+")
+    -- would silently skip them).
+    if s:sub(1, 1) == "." or s:sub(-1) == "." or s:find("..", 1, true) then
+        return false
+    end
+    -- Single-label hostname (no dots): same label rules as multi-label
+    -- (RFC 1123 permits interior hyphens, e.g. "my-router").
     if not s:match("%.") then
-        return s:match("^[a-zA-Z0-9_]+$") ~= nil
+        if #s > 63 then return false end
+        return s:match("^[a-zA-Z0-9_][a-zA-Z0-9_%-]*[a-zA-Z0-9_]$") ~= nil
+            or s:match("^[a-zA-Z0-9_]$") ~= nil
     end
     -- Multi-label: validate each label.  Allow underscores for backward
     -- compatibility (SRV/TXT records use them; RFC 1123 forbids them but
@@ -166,8 +177,11 @@ function _M.validation(datatype, data)
     elseif datatype == "ipaddr"  then return is_ip4(data) or is_ip6(data)
     elseif datatype == "hostname" then return is_hostname(data)
     elseif datatype == "port" then
+        -- Strict decimal integer: tonumber() alone accepts "80.5", "0x50",
+        -- "1e3", none of which are valid ports.
+        if not tostring(data):match("^%d+$") then return false end
         local n = tonumber(data)
-        return n ~= nil and n > 0 and n < 65536
+        return n > 0 and n < 65536
     end
     return true
 end
@@ -373,19 +387,38 @@ function _M.executeCommand(...)
     return { command = cmd, stdout = out, stderr = err, exitcode = code }
 end
 
+local function have_cmd(bin)
+    -- Lua 5.1 os.execute() returns the exit status (0 on success); on some
+    -- builds it may return true -- accept both.
+    local rc = os.execute("command -v " .. bin .. " >/dev/null 2>&1")
+    return rc == 0 or rc == true
+end
+
 function _M.wGET(url, ua)
     if not url or type(url) ~= "string" then return nil end
     ua = ua or "Wget/1.21 (HomeProxy, like v2rayN)"
     local qua = _M.shellQuote(ua)
     local qurl = _M.shellQuote(url)
-    -- Stock MiWiFi busybox wget cannot fetch HTTPS; prefer curl for https URLs
-    -- and fall back to wget otherwise (or when curl is unavailable).
-    if url:match("^https://") then
-        local r = _M.executeCommand("/usr/bin/curl -fsSL -m 20 -A " .. qua .. " " .. qurl)
-        if not _M.isEmpty(r.stdout) then return _M.trim(r.stdout) end
+    -- A nonzero exit MUST yield nil: a truncated body would otherwise be
+    -- parsed as a partial node list and good nodes deleted as stale (C4).
+    local function try(cmd)
+        local r = _M.executeCommand(cmd)
+        if r.exitcode == 0 and not _M.isEmpty(r.stdout) then
+            return _M.trim(r.stdout)
+        end
+        return nil
     end
-    local r = _M.executeCommand("/usr/bin/wget -qO- --user-agent " .. qua .. " --timeout=10 " .. qurl)
-    return _M.trim(r.stdout)
+    -- Stock MiWiFi busybox wget cannot fetch HTTPS; prefer curl for https
+    -- URLs (any curl in PATH, not just /usr/bin) and fall back to wget,
+    -- which still handles plain http and https on non-busybox builds.
+    if url:match("^https://") and have_cmd("curl") then
+        local body = try("curl -fsSL -m 20 --max-filesize 16777216 -A " .. qua .. " " .. qurl)
+        if body then return body end
+    end
+    if have_cmd("wget") then
+        return try("wget -qO- --user-agent " .. qua .. " --timeout=10 " .. qurl)
+    end
+    return try("curl -fsSL -m 20 --max-filesize 16777216 -A " .. qua .. " " .. qurl)
 end
 
 local _log_dir_created = false

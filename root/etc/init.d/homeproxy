@@ -27,9 +27,10 @@ log() {
 start_service() {
     config_load "$CONF"
 
-    local routing_mode proxy_mode
+    local routing_mode proxy_mode lan_proxy_mode
     config_get routing_mode "config" "routing_mode" "bypass_mainland_china"
     config_get proxy_mode "config" "proxy_mode" "redirect_tproxy"
+    config_get lan_proxy_mode "control" "lan_proxy_mode" "disabled"
 
     local outbound_node
     if [ "$routing_mode" != "custom" ]; then
@@ -111,12 +112,17 @@ start_service() {
         config_get table_mark "infra" "table_mark" "100"
         local ipv6_support
         config_get_bool ipv6_support "config" "ipv6_support" "0"
-        case "$proxy_mode" in
-        *"tproxy"*)
+        # tproxy and tun are independent arms (a case would make the tun arm
+        # unreachable for tproxy_tun): tproxy_tun needs BOTH the fwmark/lo
+        # routing for TPROXYed traffic AND the tun device/rules for the rest.
+        if echo "$proxy_mode" | grep -q tproxy; then
             local outbound_udp_node tproxy_mark
             config_get outbound_udp_node "config" "main_udp_node" "nil"
             config_get tproxy_mark "infra" "tproxy_mark" "101"
-            if [ "$outbound_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
+            # fwmark rule + lo local route: needed for UDP tproxy, and also
+            # for TCP tproxy in modes without a redirect inbound.
+            if [ "$outbound_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ] \
+                || ! echo "$proxy_mode" | grep -q redirect; then
                 ip rule add fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null
                 ip route add local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
                 if [ "$ipv6_support" = "1" ]; then
@@ -124,8 +130,8 @@ start_service() {
                     ip -6 route add local ::/0 dev lo table "$table_mark" 2>/dev/null
                 fi
             fi
-            ;;
-        *"tun"*)
+        fi
+        if echo "$proxy_mode" | grep -q tun; then
             local tun_name tun_mark
             config_get tun_name "infra" "tun_name" "singtun0"
             config_get tun_mark "infra" "tun_mark" "102"
@@ -138,8 +144,7 @@ start_service() {
                 ip -6 route replace default dev "$tun_name" table "$table_mark" 2>/dev/null
                 ip -6 rule add fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null
             }
-            ;;
-        esac
+        fi
 
         # sing-box (client)
         [ -e "$RUN_DIR/sing-box-c.log" ] && : > "$RUN_DIR/sing-box-c.log"
@@ -184,9 +189,11 @@ start_service() {
 
     [ "$server_enabled" = "1" ] && mkdir -p "$HP_DIR/certs"
 
-    # firewall (iptables+ipset)
+    # firewall (iptables+ipset). The flag gates the fw3 include: it must be
+    # set whenever start succeeded -- even with lan_proxy_mode=disabled, the
+    # server/tun filter accepts it installs must survive a firewall reload.
     if sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"; then
-        [ "$lan_proxy_mode" != "disabled" ] && : > "$RUN_DIR/firewall.active"
+        : > "$RUN_DIR/firewall.active"
     else
         log "Error: firewall.sh failed; firewall rules not applied."
     fi
@@ -273,11 +280,14 @@ stop_service() {
     while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
     ip -6 route del local ::/0 dev lo table "$table_mark" 2>/dev/null
     while ip rule del fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null; do :; done
+    while ip -6 rule del fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null; do :; done
 
     # Tear down the tun device (H10: was only in service_stopped, which is not
     # called from reload_service's stop).
     local tun_name
     config_get tun_name "infra" "tun_name" "singtun0"
+    ip route del default dev "$tun_name" table "$table_mark" 2>/dev/null
+    ip -6 route del default dev "$tun_name" table "$table_mark" 2>/dev/null
     ip link set "$tun_name" down 2>/dev/null
     ip tuntap del mode tun name "$tun_name" 2>/dev/null
 

@@ -13,6 +13,13 @@ uci:load(UCICONFIG)
 
 local UCISERVER = "server"
 local log_level = uci:get(UCICONFIG, UCISERVER, "log_level") or "warn"
+-- Mark server-relayed egress with self_mark so the client-side firewall
+-- steering (which may run on the same box) never recaptures it.
+local self_mark = uci:get(UCICONFIG, "infra", "self_mark") or "100"
+
+-- Drop any stale output first: an abort mid-generation must not leave an
+-- old sing-box-s.json for init.d's existence check to pick up.
+os.remove(hp.RUN_DIR .. "/sing-box-s.json")
 
 local function strToBool(v) return hp.strToBool(v) end
 local function strToInt(v) return hp.strToInt(v) end
@@ -98,7 +105,7 @@ uci:foreach(UCICONFIG, UCISERVER, function(cfg)
                 email = cfg.tls_acme_email,
                 provider = cfg.tls_acme_provider,
                 disable_http_challenge = strToBool(cfg.tls_acme_dhc),
-                disable_tls_alpn_challenge = cfg.tls_acme_dtac,
+                disable_tls_alpn_challenge = strToBool(cfg.tls_acme_dtac),
                 alternative_http_port = strToInt(cfg.tls_acme_ahp),
                 alternative_tls_port = strToInt(cfg.tls_acme_atp),
                 external_account = (cfg.tls_acme_external_account == "1") and {
@@ -140,7 +147,22 @@ uci:foreach(UCICONFIG, UCISERVER, function(cfg)
     })
 end)
 
-if #config.inbounds == 0 then os.exit(1) end
+if #config.inbounds == 0 then
+    -- Remove a stale config so init.d's existence check can't pass on it.
+    os.remove(hp.RUN_DIR .. "/sing-box-s.json")
+    os.exit(1)
+end
+
+-- Explicit direct outbound carrying self_mark: inbound traffic relayed by
+-- this server originates new connections that must bypass the client
+-- steering rules (OUTPUT hooks) on the same router.
+config.outbounds = {
+    { type = "direct", tag = "direct-out", routing_mark = strToInt(self_mark) },
+}
+config.route = { final = "direct-out" }
 
 hp.mkdir_p(hp.RUN_DIR)
-hp.writefile(hp.RUN_DIR .. "/sing-box-s.json", hp.encode_json(config))
+if not hp.writefile(hp.RUN_DIR .. "/sing-box-s.json", hp.encode_json(config)) then
+    io.stderr:write("homeproxy: ERROR: failed to write " .. hp.RUN_DIR .. "/sing-box-s.json\n")
+    os.exit(1)
+end

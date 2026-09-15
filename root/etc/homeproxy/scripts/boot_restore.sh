@@ -29,11 +29,30 @@ mkdir -p "$RUN" 2>/dev/null
 log() { echo "$(date '+%H:%M:%S') [hp-restore] $*" >>"$LOG" 2>/dev/null; }
 
 # Concurrency guard: auto_start + the cron tick can race on the same boot.
-exec 9>/var/run/hp_restore.lock 2>/dev/null || exit 0
-flock -n 9 2>/dev/null || { log "another restore in progress, exiting."; exit 0; }
+# BusyBox builds without the flock applet must not silently disable boot
+# restore -- fall back to an atomic mkdir lock (H7).
+if command -v flock >/dev/null 2>&1 && exec 9>/var/run/hp_restore.lock 2>/dev/null; then
+	flock -n 9 2>/dev/null || { log "another restore in progress, exiting."; exit 0; }
+elif ! mkdir /var/run/hp_restore.lock.d 2>/dev/null; then
+	log "another restore in progress, exiting."; exit 0
+else
+	trap 'rmdir /var/run/hp_restore.lock.d 2>/dev/null' EXIT
+fi
 
 # 1. /etc/homeproxy symlink (resources + scripts resolve through it)
-if [ ! -e /etc/homeproxy ]; then
+if [ -L /etc/homeproxy ]; then
+	# Re-assert the link: it may exist but point at a wrong/stale target.
+	ln -sfn "$HP" /etc/homeproxy 2>/dev/null
+elif [ -d /etc/homeproxy ] && [ -d "$HP" ]; then
+	# A REAL directory blocks the symlink: something like a premature
+	# `mkdir -p /etc/homeproxy/resources` (update_resources.sh runs before
+	# the restore on a boot race) created it, and the old `-e` check then
+	# skipped the link forever. Preserve anything inside, then replace.
+	cp -a /etc/homeproxy/. "$HP/" 2>/dev/null || log "WARN: could not merge stale /etc/homeproxy contents."
+	rm -rf /etc/homeproxy
+	ln -sfn "$HP" /etc/homeproxy 2>/dev/null
+	log "replaced real /etc/homeproxy dir with symlink -> $HP"
+elif [ ! -e /etc/homeproxy ]; then
 	ln -sfn "$HP" /etc/homeproxy 2>/dev/null
 	log "created /etc/homeproxy -> $HP"
 fi

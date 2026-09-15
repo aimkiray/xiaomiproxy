@@ -108,55 +108,80 @@ ALL_IPSETS="homeproxy_cn4 homeproxy_cn6 homeproxy_gfw4 homeproxy_gfw6 homeproxy_
 # and destroy ipsets. Best-effort; missing rules/chains are ignored.
 stop_fw() {
 	for ip in $IP4 $IP6; do
-		# per-interface PREROUTING jumps
-		for _li in $LAN_IFS lo; do
-			$ip -t nat    -D PREROUTING -i "$_li" -p tcp -j homeproxy_redir_lanac 2>/dev/null
-			$ip -t nat    -D PREROUTING -i "$_li" -p udp --dport 53 -j homeproxy_dns 2>/dev/null
-			$ip -t mangle -D PREROUTING -i "$_li" -p udp -j homeproxy_mangle_lanac 2>/dev/null
-			$ip -t mangle -D PREROUTING -i "$_li" -j homeproxy_tun_lanac 2>/dev/null
-			# fall back to the old single-IFARG hook names for compatibility
-			$ip -t nat    -D PREROUTING -i "$_li" -p tcp -j homeproxy_redir 2>/dev/null
-			$ip -t mangle -D PREROUTING -i "$_li" -p udp -j homeproxy_mangle 2>/dev/null
-			$ip -t mangle -D PREROUTING -i "$_li" -j homeproxy_tun_lanac 2>/dev/null
+		# Remove every jump into our chains from the built-in chains, whatever
+		# interface/proto or older revision created it. Deleting only for the
+		# CURRENT LAN_IFS leaves orphan jumps behind when the interface was
+		# renamed or the layout changed between runs.
+		for tbl in nat mangle filter; do
+			for hook in PREROUTING INPUT FORWARD OUTPUT; do
+				$ip -t "$tbl" -S "$hook" 2>/dev/null | while read -r _line; do
+					case "$_line" in
+						*" -j homeproxy_"*)
+							set -- $_line; shift  # drop "-A"
+							$ip -t "$tbl" -D "$@" 2>/dev/null ;;
+					esac
+				done
+			done
 		done
-		# iface-agnostic OUTPUT hooks (router self-traffic)
-		$ip -t nat    -D OUTPUT -p tcp -j homeproxy_redir 2>/dev/null
-		$ip -t mangle -D OUTPUT -p udp -j homeproxy_mangle_out 2>/dev/null
-		$ip -t mangle -D OUTPUT -p udp -j homeproxy_mangle_mark 2>/dev/null
-		$ip -t mangle -D OUTPUT -j homeproxy_tun 2>/dev/null
-		# also remove any unfiltered OUTPUT hooks from earlier revisions
-		$ip -t mangle -D OUTPUT -p udp -j homeproxy_mangle 2>/dev/null
 		# Two passes: flush every chain (drops cross-chain jumps), then delete.
-		# A single pass leaves referenced chains (e.g. homeproxy_mangle_mark,
-		# jumped to by homeproxy_mangle_out) non-empty and undeletable.
 		for _ch in $ALL_CHAINS_NAT; do $ip -t nat -F "$_ch" 2>/dev/null; done
 		for _ch in $ALL_CHAINS_NAT; do $ip -t nat -X "$_ch" 2>/dev/null; done
 		for _ch in $ALL_CHAINS_MANGLE; do $ip -t mangle -F "$_ch" 2>/dev/null; done
 		for _ch in $ALL_CHAINS_MANGLE; do $ip -t mangle -X "$_ch" 2>/dev/null; done
-		# filter-table accepts (firewall_pre equivalent)
-		$ip -D INPUT -j homeproxy_in 2>/dev/null
-		$ip -D FORWARD -j homeproxy_fwd 2>/dev/null
 		$ip -F homeproxy_in 2>/dev/null;  $ip -X homeproxy_in 2>/dev/null
 		$ip -F homeproxy_fwd 2>/dev/null; $ip -X homeproxy_fwd 2>/dev/null
 	done
 	for _s in $ALL_IPSETS; do ipset destroy "$_s" 2>/dev/null; done
 }
 
+# --- filter-table accepts (mirror upstream firewall_pre.uc) -------------
+# Self-contained: must also run when LAN steering is disabled (pure server
+# deployments still need their listen ports accepted). Inserted at the TOP
+# of INPUT/FORWARD because MiWiFi's own chains may end with a blanket
+# REJECT/DROP that a tail-appended rule never reaches.
+apply_fw_pre() {
+	local ip="$1" need_in=0 need_fwd=0 sect
+	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
+		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] && [ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] && need_in=1
+	done
+	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
+		need_in=1; need_fwd=1
+	fi
+	[ "$need_in" = "1" ] || return 0
+	$ip -N homeproxy_in 2>/dev/null || $ip -F homeproxy_in
+	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
+		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] || continue
+		[ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] || continue
+		local port; port=$(uci -q get "$CFG.$sect.port"); [ -n "$port" ] || continue
+		$ip -A homeproxy_in -p tcp --dport "$port" -j ACCEPT 2>/dev/null
+		$ip -A homeproxy_in -p udp --dport "$port" -j ACCEPT 2>/dev/null
+	done
+	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
+		$ip -A homeproxy_in -i "$tun_name" -j ACCEPT 2>/dev/null
+	fi
+	$ip -D INPUT -j homeproxy_in 2>/dev/null
+	$ip -I INPUT -j homeproxy_in 2>/dev/null
+	if [ "$need_fwd" = "1" ]; then
+		$ip -N homeproxy_fwd 2>/dev/null || $ip -F homeproxy_fwd
+		$ip -A homeproxy_fwd -o "$tun_name" -j ACCEPT 2>/dev/null
+		$ip -D FORWARD -j homeproxy_fwd 2>/dev/null
+		$ip -I FORWARD -j homeproxy_fwd 2>/dev/null
+	fi
+}
+
 cmd=${1:-}
 [ "$cmd" = "stop" ] && { stop_fw; exit 0; }
-[ "$cmd" = "restart" ] && stop_fw
-case "$cmd" in start|restart) ;;
+# start AND restart both purge first: stale PREROUTING jumps bound to
+# interfaces that were renamed/removed would otherwise keep steering the
+# old iface into the rebuilt chains forever (hook_prerouting only -D's the
+# CURRENT LAN_IFS).
+case "$cmd" in start|restart) stop_fw ;;
 *) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
 esac
 
-if [ "$lan_proxy_mode" = "disabled" ]; then
-	echo "homeproxy: LAN proxy disabled; no firewall rules applied." >&2
-	exit 0
-fi
-
 # Validate routing_mode (M18): unknown value silently proxies everything.
 case "$routing_mode" in
-	bypass_mainland_china|proxy_mainland_china|gfwlist|custom) ;;
+	bypass_mainland_china|proxy_mainland_china|gfwlist|global|custom) ;;
 	*)
 		echo "homeproxy: invalid routing_mode='$routing_mode' -- aborting." >&2
 		stop_fw; exit 1
@@ -165,23 +190,47 @@ esac
 
 mkdir -p "$RUN_DIR"
 
+# Server/tun filter accepts must exist even with LAN steering off, so they
+# are applied before the lan_proxy_mode gate.
+apply_fw_pre "$IP4"
+[ "$ipv6" = "1" ] && apply_fw_pre "$IP6"
+
+if [ "$lan_proxy_mode" = "disabled" ]; then
+	echo "homeproxy: LAN proxy disabled; only server/tun filter accepts applied." >&2
+	exit 0
+fi
+
 # --- ipsets ---------------------------------------------------------------
+# Populate a temp set then swap it into place. ipset swap works even when the
+# target is still referenced by live iptables rules (destroy would fail with
+# EBUSY and the recreate with EEXIST), so `start` stays idempotent on re-run
+# and across fw3 reloads.
 build_ipset() {
 	local name="$1" file="$2" fam="$3"
-	ipset destroy "$name" 2>/dev/null
-	ipset create "$name" hash:net family "$fam" maxelem 65536 2>/dev/null || return 1
+	local tmp="${name}_new"
+	ipset destroy "$tmp" 2>/dev/null
+	ipset create "$tmp" hash:net family "$fam" maxelem 65536 2>/dev/null || return 1
 	if [ -n "$file" ] && [ -f "$file" ]; then
-		awk -v n="$name" 'NF && !/^#/ {print "add "n" "$0}' "$file" 2>/dev/null | ipset restore -exist 2>/dev/null
+		awk -v n="$tmp" 'NF && !/^#/ {print "add "n" "$0}' "$file" 2>/dev/null | ipset restore -exist 2>/dev/null
 	fi
+	ipset create "$name" hash:net family "$fam" maxelem 65536 -exist 2>/dev/null \
+		|| { ipset destroy "$tmp" 2>/dev/null; return 1; }
+	ipset swap "$tmp" "$name" 2>/dev/null \
+		|| { ipset destroy "$tmp" 2>/dev/null; return 1; }
+	ipset destroy "$tmp" 2>/dev/null
 }
-# empty ipset (no file) -- used for dynamic sets dnsmasq populates.
+# dynamic set (no file) -- dnsmasq populates it. -exist keeps entries on a
+# re-apply instead of wiping what dnsmasq already learned.
 build_ipset_empty() {
 	local name="$1" fam="$2" type="${3:-hash:net}"
-	ipset destroy "$name" 2>/dev/null
-	ipset create "$name" "$type" family "$fam" maxelem 65536 2>/dev/null || return 1
+	ipset create "$name" "$type" family "$fam" maxelem 65536 -exist 2>/dev/null || return 1
 }
 load_list_ipset() {
 	# $1=ipset-name $2=family $3=space-separated-cidr-list
+	# No flush: dnsmasq adds learned IPs to wan_proxy sets via ipset=/
+	# directives and never re-adds answers already in its cache -- a flush
+	# would drop those entries until the next fresh resolution. Stale static
+	# entries linger until a full teardown, which is the safer trade-off.
 	local name="$1" fam="$2" list="$3"
 	build_ipset_empty "$name" "$fam" || return 1
 	[ -n "$list" ] || return 0
@@ -286,8 +335,13 @@ emit_dst_ipset() {
 	local ip="$1" tbl="$2" ch="$3" kind="$4" tgt="$5" set4 set6
 	if [ "$kind" = "wan_proxy" ]; then set4=homeproxy_wan_proxy4; set6=homeproxy_wan_proxy6
 	elif [ "$kind" = "wan_direct" ]; then set4=homeproxy_wan_direct4; set6=homeproxy_wan_direct6; fi
-	$ip -t "$tbl" -A "$ch" -m set --match-set "$set4" dst -j "$tgt" 2>/dev/null
-	if [ "$ipv6" = "1" ]; then $ip -t "$tbl" -A "$ch" -m set --match-set "$set6" dst -j "$tgt" 2>/dev/null; fi
+	# Family-correct: an inet6 set can never match under iptables (and vice
+	# versa) -- emitting both leaves dead rules and spurious set references.
+	if [ "$ip" = "$IP6" ]; then
+		$ip -t "$tbl" -A "$ch" -m set --match-set "$set6" dst -j "$tgt" 2>/dev/null
+	else
+		$ip -t "$tbl" -A "$ch" -m set --match-set "$set4" dst -j "$tgt" 2>/dev/null
+	fi
 }
 
 # source-list match (ipv4 list + ipv6 list + mac) -> target.
@@ -314,11 +368,16 @@ emit_steering() {
 	local ip="$1" tbl="$2" ch="$3" rset="$4" port_tgt="$5" act_tgt="$6"
 	$ip -t "$tbl" -N "$ch" 2>/dev/null || $ip -t "$tbl" -F "$ch"
 	# loop prevention: sing-box's own egress carries self_mark (routing_mark).
-	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark/$self_mark" -j RETURN 2>/dev/null
-	emit_dst_ipset "$ip" "$tbl" "$ch" wan_proxy "$port_tgt"
+	# Exact match -- a masked match (100/100) also matches marks that merely
+	# have those bits set (101, 102, QoS marks...), exempting real traffic.
+	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark" -j RETURN 2>/dev/null
+	# "always proxy" destinations/clients go to the UNFILTERED target:
+	# under routing_port=common the port-filtered target would only proxy
+	# well-known ports, which is not what an explicit always-proxy list means.
+	emit_dst_ipset "$ip" "$tbl" "$ch" wan_proxy "$act_tgt"
 	emit_local "$ip" "$tbl" "$ch"
 	if [ "$routing_mode" != "custom" ]; then
-		emit_src_list "$ip" "$tbl" "$ch" lan_global "$port_tgt"
+		emit_src_list "$ip" "$tbl" "$ch" lan_global "$act_tgt"
 	fi
 	emit_dst_ipset "$ip" "$tbl" "$ch" wan_direct RETURN
 	emit_routing "$ip" "$tbl" "$ch" "$rset"
@@ -339,7 +398,7 @@ emit_gate() {
 	local ip="$1" tbl="$2" ch="$3" tgt="$4"
 	$ip -t "$tbl" -N "$ch" 2>/dev/null || $ip -t "$tbl" -F "$ch"
 	# loop prevention (router-self packets re-entering via lo carry self_mark).
-	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark/$self_mark" -j RETURN 2>/dev/null
+	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark" -j RETURN 2>/dev/null
 	# do not steer DNS over UDP here -- the nat-table homeproxy_dns handles it.
 	[ "$tbl" = "mangle" ] && $ip -t "$tbl" -A "$ch" -p udp --dport 53 -j RETURN 2>/dev/null
 	if [ "$lan_proxy_mode" = "listed_only" ]; then
@@ -391,38 +450,51 @@ apply_tcp() {
 	$ip -t nat -A OUTPUT -p tcp -j homeproxy_redir
 }
 
-# --- UDP tproxy (mangle) ---------------------------------------------------
-apply_udp() {
-	local ip="$1" rset="$2"
+# --- tproxy (mangle) -------------------------------------------------------
+# $3=with_udp $4=with_tcp. Pure `tproxy` mode (no redirect inbound) TPROXYs
+# TCP too; redirect_* modes only TPROXY UDP (TCP goes to the redirect port).
+# --tproxy-mark uses a FULL mask: a partial mask preserves unrelated mark
+# bits (e.g. MiWiFi QoS), producing a composite fwmark the exact-match
+# `ip rule fwmark $tproxy_mark` then fails to route -> leaked/dropped traffic.
+apply_tproxy() {
+	local ip="$1" rset="$2" with_udp="${3:-1}" with_tcp="${4:-0}"
 	$ip -t mangle -N homeproxy_mangle_act 2>/dev/null || $ip -t mangle -F homeproxy_mangle_act
-	$ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$tproxy_mark/$tproxy_mark"
+	[ "$with_udp" = "1" ] && $ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$tproxy_mark/0xffffffff"
+	[ "$with_tcp" = "1" ] && $ip -t mangle -A homeproxy_mangle_act -p tcp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$tproxy_mark/0xffffffff"
 	$ip -t mangle -N homeproxy_mangle_port 2>/dev/null || $ip -t mangle -F homeproxy_mangle_port
-	if [ "$routing_port" = "common" ]; then
-		$ip -t mangle -A homeproxy_mangle_port -p udp -m multiport --dports "$common_port" -j homeproxy_mangle_act 2>/dev/null
-	else
-		$ip -t mangle -A homeproxy_mangle_port -p udp -j homeproxy_mangle_act
-	fi
+	local protos=""
+	[ "$with_udp" = "1" ] && protos="udp"
+	[ "$with_tcp" = "1" ] && protos="$protos tcp"
+	for _p in $protos; do
+		if [ "$routing_port" = "common" ]; then
+			$ip -t mangle -A homeproxy_mangle_port -p "$_p" -m multiport --dports "$common_port" -j homeproxy_mangle_act 2>/dev/null
+		else
+			$ip -t mangle -A homeproxy_mangle_port -p "$_p" -j homeproxy_mangle_act
+		fi
+	done
 	emit_steering "$ip" mangle homeproxy_mangle "$rset" homeproxy_mangle_port homeproxy_mangle_act
 	emit_gate "$ip" mangle homeproxy_mangle_lanac homeproxy_mangle
-	hook_prerouting "$ip" mangle "-p udp" homeproxy_mangle_lanac
-	# Router-self UDP steering (mirrors upstream homeproxy_mangle_output -> _mark).
+	for _p in $protos; do hook_prerouting "$ip" mangle "-p $_p" homeproxy_mangle_lanac; done
+	# Router-self steering (mirrors upstream homeproxy_mangle_output -> _mark).
 	# A dedicated steering chain exempts sing-box's own egress (self_mark), then
 	# applies wan_proxy/local/wan_direct/routing split, ending in MARK tproxy_mark.
 	# ip rule (fwmark tproxy_mark -> table -> local dev lo) then re-delivers the
 	# packet on lo, where the PREROUTING hook re-enters homeproxy_mangle -> TPROXY.
 	$ip -t mangle -N homeproxy_mangle_mark 2>/dev/null || $ip -t mangle -F homeproxy_mangle_mark
-	if [ "$routing_port" = "common" ]; then
-		$ip -t mangle -A homeproxy_mangle_mark -p udp -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
-	fi
-	$ip -t mangle -A homeproxy_mangle_mark -p udp -j MARK --set-mark "$tproxy_mark"
+	for _p in $protos; do
+		if [ "$routing_port" = "common" ]; then
+			$ip -t mangle -A homeproxy_mangle_mark -p "$_p" -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
+		fi
+		$ip -t mangle -A homeproxy_mangle_mark -p "$_p" -j MARK --set-mark "$tproxy_mark"
+		$ip -t mangle -D OUTPUT -p "$_p" -j homeproxy_mangle_out 2>/dev/null
+		$ip -t mangle -A OUTPUT -p "$_p" -j homeproxy_mangle_out
+		# legacy hook cleanup (older revisions jumped straight to the mark chain)
+		$ip -t mangle -D OUTPUT -p "$_p" -j homeproxy_mangle_mark 2>/dev/null
+		# re-entry: lo packets (already tproxy-marked) run through steering -> TPROXY.
+		$ip -t mangle -D PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
+		$ip -t mangle -A PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
+	done
 	emit_steering "$ip" mangle homeproxy_mangle_out "$rset" homeproxy_mangle_mark homeproxy_mangle_mark
-	$ip -t mangle -D OUTPUT -p udp -j homeproxy_mangle_out 2>/dev/null
-	$ip -t mangle -A OUTPUT -p udp -j homeproxy_mangle_out
-	# legacy hook cleanup (older revisions jumped straight to the mark chain)
-	$ip -t mangle -D OUTPUT -p udp -j homeproxy_mangle_mark 2>/dev/null
-	# re-entry: lo packets (already tproxy-marked) run through steering -> TPROXY.
-	$ip -t mangle -D PREROUTING -i lo -p udp -j homeproxy_mangle 2>/dev/null
-	$ip -t mangle -A PREROUTING -i lo -p udp -j homeproxy_mangle 2>/dev/null
 }
 
 # --- TUN steering (mangle MARK) ------------------------------------------
@@ -441,7 +513,7 @@ apply_tun() {
 	# steering chain: tun egress + loop prevention at top, then standard order.
 	$ip -t mangle -N homeproxy_tun 2>/dev/null || $ip -t mangle -F homeproxy_tun
 	$ip -t mangle -A homeproxy_tun -i "$tun_name" -j RETURN 2>/dev/null
-	$ip -t mangle -A homeproxy_tun -m mark --mark "$self_mark/$self_mark" -j RETURN 2>/dev/null
+	$ip -t mangle -A homeproxy_tun -m mark --mark "$self_mark" -j RETURN 2>/dev/null
 	emit_dst_ipset "$ip" mangle homeproxy_tun wan_proxy homeproxy_tun_mark
 	emit_local "$ip" mangle homeproxy_tun
 	if [ "$routing_mode" != "custom" ]; then
@@ -477,61 +549,32 @@ apply_dns() {
 	hook_prerouting "$ip" nat "-p udp --dport 53" homeproxy_dns
 }
 
-# --- filter-table accepts (mirror upstream firewall_pre.uc) -------------
-apply_fw_pre() {
-	local ip="$1" need_in=0 need_fwd=0 sect
-	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
-		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] && [ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] && need_in=1
-	done
-	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
-		need_in=1; need_fwd=1
-	fi
-	[ "$need_in" = "1" ] || return 0
-	$ip -N homeproxy_in 2>/dev/null || $ip -F homeproxy_in
-	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
-		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] || continue
-		[ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] || continue
-		local port; port=$(uci -q get "$CFG.$sect.port"); [ -n "$port" ] || continue
-		$ip -A homeproxy_in -p tcp --dport "$port" -j ACCEPT 2>/dev/null
-		$ip -A homeproxy_in -p udp --dport "$port" -j ACCEPT 2>/dev/null
-	done
-	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
-		$ip -A homeproxy_in -i "$tun_name" -j ACCEPT 2>/dev/null
-	fi
-	$ip -C INPUT -j homeproxy_in 2>/dev/null || $ip -A INPUT -j homeproxy_in
-	if [ "$need_fwd" = "1" ]; then
-		$ip -N homeproxy_fwd 2>/dev/null || $ip -F homeproxy_fwd
-		$ip -A homeproxy_fwd -o "$tun_name" -j ACCEPT 2>/dev/null
-		$ip -C FORWARD -j homeproxy_fwd 2>/dev/null || $ip -A FORWARD -j homeproxy_fwd
-	fi
-}
-
 # --- apply per family -----------------------------------------------------
-# UDP tproxy is only meaningful when sing-box actually opens a tproxy inbound
-# (a dedicated UDP node or custom routing). Mirrors generate_client.lua gating.
+# UDP tproxy is only steered when the user wants UDP proxied (a dedicated
+# UDP node or custom routing). In a mode WITHOUT redirect, TCP is TPROXY'd
+# to the same inbound instead -- pure `tproxy` mode proxies both protocols.
 main_udp_node=$(uci_get "config.main_udp_node"); main_udp_node=${main_udp_node:-nil}
-# A tproxy inbound exists whenever main_udp_node != nil (incl. "same") or
-# routing_mode is custom -- mirrors generate_client.lua's tproxy_port gating.
 udp_tproxy=0
 if [ "$main_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
 	udp_tproxy=1
+fi
+tcp_via_tproxy=0
+if echo "$proxy_mode" | grep -q tproxy && ! echo "$proxy_mode" | grep -q redirect; then
+	tcp_via_tproxy=1
 fi
 
 if echo "$proxy_mode" | grep -q redirect; then
 	apply_tcp "$IP4" "$route_set4"
 	if [ "$ipv6" = "1" ]; then apply_tcp "$IP6" "$route_set6"; fi
 fi
-if echo "$proxy_mode" | grep -q tproxy && [ "$udp_tproxy" = "1" ]; then
-	apply_udp "$IP4" "$route_set4"
-	if [ "$ipv6" = "1" ]; then apply_udp "$IP6" "$route_set6"; fi
+if echo "$proxy_mode" | grep -q tproxy && { [ "$udp_tproxy" = "1" ] || [ "$tcp_via_tproxy" = "1" ]; }; then
+	apply_tproxy "$IP4" "$route_set4" "$udp_tproxy" "$tcp_via_tproxy"
+	if [ "$ipv6" = "1" ]; then apply_tproxy "$IP6" "$route_set6" "$udp_tproxy" "$tcp_via_tproxy"; fi
 fi
 if echo "$proxy_mode" | grep -q tun; then
 	apply_tun "$IP4" "$route_set4"
 	if [ "$ipv6" = "1" ]; then apply_tun "$IP6" "$route_set6"; fi
 fi
-# filter-table accepts (server inbound + tun forward/input)
-apply_fw_pre "$IP4"
-if [ "$ipv6" = "1" ]; then apply_fw_pre "$IP6"; fi
 
 # DNS redirect to dnsmasq (which steers via conf-dir). Skipped when the user
 # disables it or dnsmasq already hijacks DNS, to avoid a double redirect.

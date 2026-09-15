@@ -32,13 +32,18 @@ local function log(msg) hp.log(msg, "SUBSCRIBE") end
 -- cron-vs-manual use case (updates take < 60s).
 local lock_path = hp.RUN_DIR .. "/subscribe.lock"
 local MAX_LOCK_AGE = 120  -- seconds
+-- RUN_DIR must exist before the lock file can be created (mkdir was
+-- previously done later, silently disabling the lock on first run).
+hp.mkdir_p(hp.RUN_DIR)
 do
   local lock_time = tonumber(hp.trim(hp.readfile(lock_path) or ""))
   if lock_time then
     local age = os.time() - lock_time
     if age >= 0 and age < MAX_LOCK_AGE then
       log("Another subscription update is running (started " .. age .. "s ago), aborting.")
-      os.exit(0)
+      -- Nonzero: a skipped update is NOT a success -- callers (web/CLI) must
+      -- not treat it as "nodes refreshed" (e.g. by restarting the service).
+      os.exit(3)
     end
   end
   -- Write current timestamp as the lock.
@@ -145,6 +150,13 @@ local function detect_features()
 		feat.with_hysteria = true
 	end
 	os.remove(tmp)
+	-- Do not cache when the binary could not even report its version: an
+	-- all-false probe caused by a missing/broken sing-box would otherwise be
+	-- served from cache forever after the binary is fixed.
+	if signature:match("\nunknown$") then
+		log("sing-box binary unresponsive; feature cache skipped.")
+		return feat
+	end
 	local cache = hp.RUN_DIR .. "/singbox-features.json"
 	-- Keep the temporary cache beside the final file so rename stays atomic
 	-- even when /tmp and RUN_DIR are different mounts.
@@ -177,6 +189,19 @@ local function decode_subscription_body(res)
 end
 
 local node_cache, node_result = {}, {}
+
+-- Loopback/unspecified/link-local subscription hosts are never legitimate:
+-- the router would fetch them blind (SSRF surface), and URLs can also be
+-- written via UCI directly, bypassing the web API's validation.
+local function is_local_url(url)
+	local u = hp.parseURL(url)
+	local h = u and u.hostname or nil
+	if not h then return false end
+	return h == "localhost"
+		or h:match("^127%.") or h:match("^169%.254%.")
+		or h == "0.0.0.0" or h == "::" or h == "::1" or h == "[::1]"
+		or h:lower():match("^fe80:") or h:lower():match("^[fc][cd]")
+end
 
 -- Prune gone node names out of a urltest list UCI option; returns
 -- (kept count, whether anything was removed).  Does NOT commit — the caller
@@ -221,9 +246,12 @@ local function main()
 	end
 
 	for _, configured_url in ipairs(subscription_urls) do
+			configured_url = hp.trim(configured_url)
 			if isEmpty(configured_url) then
 			elseif not configured_url:match("^https?://") and not configured_url:match("^sip008://") then
-				log("Skipping invalid URL: " .. configured_url)
+				log("Skipping invalid URL: " .. tostring(configured_url))
+			elseif is_local_url(configured_url) then
+				log("Skipping loopback/link-local URL (SSRF guard): " .. tostring(configured_url))
 			else
 				-- A fragment identifies a local subscription label, not the remote
 				-- resource.  Do not let it create a separate group or reach curl.
@@ -249,14 +277,22 @@ local function main()
 					-- server/method fields; unrelated JSON must fall through.
 					local candidate = (type(j.servers) == "table") and j.servers
 						or (j[1] ~= nil and j) or nil
-					local srvs = candidate and candidate[1]
+					-- candidate[1] must be a table: indexing a string/number
+					-- element (malformed JSON) would crash the whole update.
+					local srvs = candidate and type(candidate[1]) == "table"
 						and candidate[1].server and candidate[1].method and candidate or nil
 					if srvs then
 						nodes = {}
 						for _, s in ipairs(srvs) do
-							push(nodes, { nodetype = "sip008", remarks = s.remarks, server = s.server,
-								server_port = s.server_port, method = s.method, password = s.password,
-								plugin = s.plugin, plugin_opts = s.plugin_opts })
+							-- Elements past [1] are unguarded: a number/boolean
+							-- entry would crash the whole update on s.remarks.
+							if type(s) == "table" and s.server and s.method then
+								push(nodes, { nodetype = "sip008",
+									remarks = (type(s.remarks) == "string") and s.remarks or nil,
+									server = s.server, server_port = s.server_port,
+									method = s.method, password = s.password,
+									plugin = s.plugin, plugin_opts = s.plugin_opts })
+							end
 						end
 					end
 				end
@@ -268,17 +304,25 @@ local function main()
 				local count = 0
 				for _, n in ipairs(nodes) do
 					if not isEmpty(n) then
-						local cfg = parse_uri(n)
+						-- pcall per entry: one malformed link must not abort
+						-- the entire subscription update.
+						local pok, cfg = pcall(parse_uri, n)
+						if not pok then
+							log("Node parse error (skipped): " .. tostring(cfg))
+							cfg = nil
+						end
 						if not isEmpty(cfg) then
 							local lbl = cfg.label
 							cfg.label = nil
 							local confHash = hp.md5(hp.encode_json(cfg))
 							-- Use namespaced hash to match the section name scheme (C1 fix).
-							local nameHash = lbl and hp.md5(groupHash .. "\x00" .. lbl) or nil
+							-- "|" separator: a NUL byte cannot survive the shell pipeline
+							-- inside hp.md5 (arg lists are NUL-terminated).
+							local nameHash = lbl and hp.md5(groupHash .. "|" .. lbl) or nil
 							cfg.label = lbl
 							if filter_check(lbl) then
 								log("Skipping filtered node: " .. tostring(lbl))
-							elseif node_cache[groupHash][confHash] or node_cache[groupHash][nameHash] then
+							elseif node_cache[groupHash][confHash] or (nameHash and node_cache[groupHash][nameHash]) then
 								log("Skipping duplicate node: " .. tostring(lbl))
 							else
 								if cfg.tls == "1" and allow_insecure == "1" then
@@ -315,8 +359,11 @@ local function main()
 		return
 	end
 
-	-- remove stale nodes + update existing
-	local added, removed = 0, 0
+	-- remove stale nodes + update existing.
+	-- Collect deletions first: deleting a section inside uci:foreach mutates
+	-- the very list being iterated.
+	local added, removed, nodes_changed = 0, 0, false
+	local to_delete = {}
 	uci:foreach(CFG, UCINODE, function(cfg)
 		if not cfg.grouphash then return end -- user-created node
 		local gh = cfg.grouphash
@@ -325,26 +372,39 @@ local function main()
 		if node_cache[gh] and next(node_cache[gh]) == nil then
 			return
 		elseif not node_cache[gh] or not node_cache[gh][cfg[".name"]] then
-			uci:delete(CFG, cfg[".name"])
-			removed = removed + 1
+			to_delete[#to_delete + 1] = cfg[".name"]
 			log("Removing node: " .. tostring(cfg.label))
 		else
 			local newcfg = node_cache[gh][cfg[".name"]]
 			-- Apply all fields from the new node (handles field additions).
 			for k, v in pairs(newcfg) do
 				if k:sub(1, 1) ~= "." and k ~= "isExisting" then
+					local old = cfg[k]
+					local same
+					if type(old) == "table" and type(v) == "table" and #old == #v then
+						same = true
+						for i = 1, #v do if tostring(old[i]) ~= tostring(v[i]) then same = false; break end end
+					else
+						same = tostring(old) == tostring(v)
+					end
+					if not same then nodes_changed = true end
 					uci:set(CFG, cfg[".name"], k, v)
 				end
 			end
 			-- Delete fields present in the old node but absent from the new.
 			for k in pairs(cfg) do
 				if k:sub(1, 1) ~= "." and newcfg[k] == nil then
+					nodes_changed = true
 					uci:delete(CFG, cfg[".name"], k)
 				end
 			end
 			newcfg.isExisting = true
 		end
 	end)
+	for _, sname in ipairs(to_delete) do
+		uci:delete(CFG, sname)
+		removed = removed + 1
+	end
 
 	-- add new nodes
 	for _, nodes in ipairs(node_result) do
@@ -353,7 +413,7 @@ local function main()
 				-- Namespace section name by groupHash to prevent cross-subscription
 				-- label collisions (C1): two subs with "HK 01" would otherwise
 				-- overwrite each other's UCI section every run.
-				local nameHash = hp.md5(node.grouphash .. "\x00" .. node.label)
+				local nameHash = hp.md5(node.grouphash .. "|" .. tostring(node.label))
 				uci:set(CFG, nameHash, "node")
 				for k, v in pairs(node) do
 					if k ~= "isExisting" then uci:set(CFG, nameHash, k, v) end
@@ -364,34 +424,72 @@ local function main()
 		end
 	end
 
-	local need_restart = (via_proxy ~= "1")
+	-- Clean references to nodes just removed: custom-mode routing_node.node /
+	-- urltest_nodes pointing at a deleted node would dangle (the generator
+	-- used to re-wire the rule onto the previous outbound).
+	uci:foreach(CFG, "routing_node", function(s)
+		local n = s.node
+		if not isEmpty(n) and n ~= "urltest" then
+			local sec = uci:get_all(CFG, n)
+			if not sec or sec[".type"] ~= UCINODE then
+				uci:delete(CFG, s[".name"], "node")
+				nodes_changed = true
+				log("routing_node " .. tostring(s[".name"]) .. " referenced removed node " .. tostring(n) .. " -- cleared.")
+			end
+		end
+		local l = s.urltest_nodes
+		if type(l) == "table" then
+			local kept, ch = {}, false
+			for _, v in ipairs(l) do
+				local sec = uci:get_all(CFG, v)
+				if sec and sec[".type"] == UCINODE then kept[#kept + 1] = v else ch = true end
+			end
+			if ch then
+				nodes_changed = true
+				if #kept > 0 then uci:set(CFG, s[".name"], "urltest_nodes", kept)
+				else uci:delete(CFG, s[".name"], "urltest_nodes") end
+			end
+		end
+	end)
+
+	-- When updating via proxy the service was never stopped, so it must be
+	-- restarted whenever the node set actually changed -- previously it was
+	-- only restarted when the main node needed repair, so committed nodes
+	-- never took effect (H5).
+	local need_restart = (via_proxy ~= "1") or added > 0 or removed > 0 or nodes_changed
+	-- Prune the urltest member lists UNCONDITIONALLY: stale entries left while
+	-- a plain node is active would dangle the moment the user switches to
+	-- urltest before the next update run.
+	local ut_n, ut_changed = prune_urltest_list("main_urltest_nodes")
+	local utu_n, utu_changed = prune_urltest_list("main_udp_urltest_nodes")
+	if ut_changed or utu_changed then need_restart = true end
 	if not isEmpty(main_node) then
 		local first
 		uci:foreach(CFG, UCINODE, function(s) first = s[".name"]; return false end)
 		if first then
+			local function is_node(name)
+				local sec = uci:get_all(CFG, name)
+				return sec ~= nil and sec[".type"] == UCINODE
+			end
 			if main_node == "urltest" then
-				local n, changed = prune_urltest_list("main_urltest_nodes")
-				if changed then need_restart = true end
-				if n == 0 then
+				if ut_n == 0 then
 					uci:set(CFG, UCIMAIN, "main_node", first)
 					need_restart = true
 					log("Main node is gone, switching to the first node.")
 				end
-			elseif not uci:get_all(CFG, main_node) then
+			elseif not is_node(main_node) then
 				uci:set(CFG, UCIMAIN, "main_node", first)
 				need_restart = true
 				log("Main node is gone, switching to the first node.")
 			end
 			if not isEmpty(main_udp_node) and main_udp_node ~= "same" then
 				if main_udp_node == "urltest" then
-					local n, changed = prune_urltest_list("main_udp_urltest_nodes")
-					if changed then need_restart = true end
-					if n == 0 then
+					if utu_n == 0 then
 						uci:set(CFG, UCIMAIN, "main_udp_node", first)
 						need_restart = true
 						log("Main UDP node is gone, switching to the first node.")
 					end
-				elseif not uci:get_all(CFG, main_udp_node) then
+				elseif not is_node(main_udp_node) then
 					uci:set(CFG, UCIMAIN, "main_udp_node", first)
 					need_restart = true
 					log("Main UDP node is gone, switching to the first node.")

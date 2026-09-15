@@ -12,6 +12,10 @@ local uci  = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 local UCICONFIG = "homeproxy"
 uci:load(UCICONFIG)
 
+-- Remove any stale output up front: an error()/os.exit mid-generation must
+-- not leave a previous JSON that init.d's existence check would then pass.
+os.remove(hp.RUN_DIR .. "/sing-box-c.json")
+
 local UCIINFRA = "infra"
 local UCIMAIN  = "config"
 local UCICONTROL = "control"
@@ -34,7 +38,12 @@ local function map(arr, fn)
     if not arr then return nil end
     if type(arr) ~= "table" then arr = { arr } end
     local out = {}
-    for i, v in ipairs(arr) do out[i] = fn(v) end
+    -- Skip nil results: writing fn(v) at index i leaves a sparse table that
+    -- clean() then encodes as a JSON *object* where sing-box needs an array.
+    for _, v in ipairs(arr) do
+        local r = fn(v)
+        if r ~= nil then out[#out + 1] = r end
+    end
     return out
 end
 local function filter(arr, fn)
@@ -52,18 +61,27 @@ local function contains(arr, val)
 end
 
 local function get_wan_dns()
+    -- Reject loopback/unspecified resolvers: they point back at the local
+    -- dnsmasq, which forwards right into sing-box -- a resolution loop.
+    -- A UCI "dns" list is a table; take its first entry.
+    local function valid_ns(ns)
+        if type(ns) == "table" then ns = ns[1] end
+        if type(ns) ~= "string" or ns == "" then return nil end
+        if ns:match("^127%.") or ns == "::1" or ns == "0.0.0.0" or ns == "::" then return nil end
+        return hp.validation("ipaddr", ns) and ns or nil
+    end
     for _, p in ipairs({ "/tmp/resolv.conf.auto", "/tmp/resolv.conf.d/resolv.conf.auto",
                         "/tmp/resolv.conf" }) do
         local f = io.open(p, "r")
         if f then
             for line in f:lines() do
-                local ns = line:match("^%s*nameserver%s+([%d%.:%a]+)")
+                local ns = valid_ns(line:match("^%s*nameserver%s+([%d%.:%a]+)"))
                 if ns then f:close(); return ns end
             end
             f:close()
         end
     end
-    return uci:get("network", "wan", "dns")
+    return valid_ns(uci:get("network", "wan", "dns"))
 end
 
 local routing_mode = uget(UCIMAIN, "routing_mode") or "bypass_mainland_china"
@@ -79,7 +97,7 @@ local ntp_server = uget(UCIINFRA, "ntp_server") or "time.apple.com"
 local ipv6_support = uget(UCIMAIN, "ipv6_support") or "0"
 
 local main_node, main_udp_node, dedicated_udp_node, default_outbound, default_outbound_dns,
-      domain_strategy, sniff_override, dns_server, china_dns_server, dns_default_strategy,
+      domain_strategy, dns_server, china_dns_server, dns_default_strategy,
       dns_default_server, dns_disable_cache, dns_disable_cache_expire, dns_independent_cache,
       dns_client_subnet, cache_file_store_rdrc, cache_file_rdrc_timeout,
       direct_domain_list, proxy_domain_list
@@ -91,7 +109,13 @@ if routing_mode ~= "custom" then
         and main_udp_node ~= "same" and main_udp_node ~= main_node
 
     dns_server = uget(UCIMAIN, "dns_server")
-    if isEmpty(dns_server) or dns_server == "wan" then dns_server = wan_dns end
+    -- Bare "wan"/unset means the ISP resolver -- plain UDP; DoH would fail.
+    -- An explicit bare IP keeps the deliberate DoH upgrade (see main-dns).
+    local dns_server_proto = "https"
+    if isEmpty(dns_server) or dns_server == "wan" then
+        dns_server = wan_dns
+        dns_server_proto = "udp"
+    end
 
     if routing_mode == "bypass_mainland_china" then
         china_dns_server = uget(UCIMAIN, "china_dns_server")
@@ -116,10 +140,21 @@ if routing_mode ~= "custom" then
     direct_domain_list = load_list("direct_list.txt")
     proxy_domain_list  = load_list("proxy_list.txt")
 
-    sniff_override = uget(UCIINFRA, "sniff_override") or "1"
 else
     dns_default_strategy  = uget(UCIDNS, "default_strategy") or uget(UCIDNS, "dns_strategy")
     dns_default_server     = uget(UCIDNS, "default_server")
+    -- default_server must resolve to an *enabled* dns_server section (or a
+    -- builtin tag); a dangling or disabled name becomes a cfg-*-dns tag that
+    -- is never emitted, and sing-box rejects the config.
+    if not isEmpty(dns_default_server)
+        and dns_default_server ~= "default-dns" and dns_default_server ~= "system-dns" then
+        local sec = uci:get_all(UCICONFIG, dns_default_server)
+        if not sec or sec.enabled ~= "1" then
+            io.stderr:write("homeproxy: WARNING: dns.default_server '" .. tostring(dns_default_server)
+                .. "' is not an enabled dns_server section -- falling back to system-dns.\n")
+            dns_default_server = "system-dns"
+        end
+    end
     dns_disable_cache      = uget(UCIDNS, "disable_cache")
     dns_disable_cache_expire = uget(UCIDNS, "disable_cache_expire")
     dns_independent_cache  = uget(UCIDNS, "independent_cache")
@@ -130,7 +165,6 @@ else
     default_outbound       = uget(UCIROUTING, "default_outbound") or "nil"
     default_outbound_dns   = uget(UCIROUTING, "default_outbound_dns") or "default-dns"
     domain_strategy        = uget(UCIROUTING, "domain_strategy")
-    sniff_override         = uget(UCIROUTING, "sniff_override")
 end
 
 local proxy_mode = uget(UCIMAIN, "proxy_mode") or "redirect_tproxy"
@@ -147,11 +181,19 @@ else
     udp_timeout = uget(UCIINFRA, "udp_timeout")
 end
 
+-- self_mark must exist in EVERY mode, not just redirect: all outbounds carry
+-- it as routing_mark so sing-box egress escapes the firewall's own OUTPUT
+-- steering. Without it, tproxy/tun-only modes loop traffic back into sing-box.
+self_mark = uget(UCIINFRA, "self_mark") or "100"
+if not tostring(self_mark):match("^%d+$") then
+    io.stderr:write("homeproxy: WARNING: self_mark '" .. tostring(self_mark)
+        .. "' is not numeric -- using 100.\n")
+    self_mark = "100"
+end
 if proxy_mode:find("redirect") then
-    self_mark = uget(UCIINFRA, "self_mark") or "100"
     redirect_port = uget(UCIINFRA, "redirect_port") or "5331"
 end
-if proxy_mode:find("tproxy") and (main_udp_node ~= "nil" or routing_mode == "custom") then
+if proxy_mode:find("tproxy") then
     tproxy_port = uget(UCIINFRA, "tproxy_port") or "5332"
 end
 if proxy_mode:find("tun") then
@@ -220,6 +262,9 @@ local function generate_endpoint(node)
             }
         } or nil,
         system = (node.type == "wireguard") and false or nil,
+        -- DialerOptions field: without it the wg handshake egresses unmarked
+        -- and the OUTPUT steering hook recaptures it -> handshake loop.
+        routing_mark = strToInt(self_mark),
         tcp_fast_open = strToBool(node.tcp_fast_open),
         tcp_multi_path = strToBool(node.tcp_multi_path),
         udp_fragment = strToBool(node.udp_fragment),
@@ -418,7 +463,7 @@ if not isEmpty(main_node) then
     -- single tunnel connection with builtired reconnection, eliminating the
     -- "read response: EOF" errors when the proxy link's TCP connection is
     -- closed by any layer (anytls idle reaping, server NAT, carrier).
-    for k, v in pairs(parse_dnsserver(dns_server, "https") or {}) do main_dns[k] = v end
+    for k, v in pairs(parse_dnsserver(dns_server, dns_server_proto) or {}) do main_dns[k] = v end
     push(config.dns.servers, main_dns)
     config.dns.final = "main-dns"
 
@@ -507,8 +552,11 @@ if proxy_mode:find("redirect") then
         listen_port = tonumber(redirect_port) })
 end
 if tproxy_port then
+    -- "tcp,udp": in a tproxy-only mode (no redirect inbound) the firewall
+    -- TPROXYs TCP here as well; in redirect_tproxy TCP goes to redirect-in
+    -- and the tcp side of this listener simply stays unused.
     push(config.inbounds, { type = "tproxy", tag = "tproxy-in", listen = "::",
-        listen_port = tonumber(tproxy_port), network = "udp",
+        listen_port = tonumber(tproxy_port), network = "tcp,udp",
         udp_timeout = strToTime(udp_timeout) })
 end
 if proxy_mode:find("tun") then
@@ -536,17 +584,33 @@ local function add_outbound(node_cfg, tag)
     if ob then push(config.outbounds, ob) end
 end
 
+-- urltest member lists name node SECTIONS; a member that no longer exists
+-- would emit a dangling cfg-*-out reference that sing-box check rejects.
+local function filter_node_list(list, owner)
+    return filter(list or {}, function(name)
+        local sec = uci:get_all(UCICONFIG, name)
+        if not sec or sec[".type"] ~= UCINODE then
+            io.stderr:write("homeproxy: WARNING: " .. tostring(owner)
+                .. " references missing node " .. tostring(name) .. " -- dropped.\n")
+            return false
+        end
+        return true
+    end)
+end
+
 if not isEmpty(main_node) then
     local urltest_nodes = {}
     if main_node == "urltest" then
         local nodes = uget(UCIMAIN, "main_urltest_nodes") or {}
         if type(nodes) ~= "table" then nodes = { nodes } end
+        nodes = filter_node_list(nodes, "main_urltest_nodes")
         -- Guard against empty urltest node list (H16): clean() drops an empty
         -- outbounds array, producing a config sing-box rejects ("outbounds
         -- required").  Fall back to direct-out so the config remains valid.
         if #nodes == 0 then
             io.stderr:write("homeproxy: WARNING: main_urltest_nodes is empty -- falling back to direct outbound.\n")
-            push(config.outbounds, { type = "direct", tag = "main-out" })
+            push(config.outbounds, { type = "direct", tag = "main-out",
+                routing_mark = strToInt(self_mark) })
         else
             local interval = uget(UCIMAIN, "main_urltest_interval")
             local interval_n = strToInt(interval)
@@ -567,8 +631,19 @@ if not isEmpty(main_node) then
 
     if main_udp_node == "urltest" then
         local nodes = uget(UCIMAIN, "main_udp_urltest_nodes") or {}
+        if type(nodes) ~= "table" then nodes = { nodes } end
+        nodes = filter_node_list(nodes, "main_udp_urltest_nodes")
+        if #nodes == 0 then
+            -- Same guard as main-out: an empty urltest outbounds array is
+            -- cleaned away, leaving a broken reference from the udp rule.
+            io.stderr:write("homeproxy: WARNING: main_udp_urltest_nodes is empty -- UDP falls back to direct.\n")
+            push(config.outbounds, { type = "direct", tag = "main-udp-out",
+                routing_mark = strToInt(self_mark) })
+            nodes = nil
+        end
         local interval = uget(UCIMAIN, "main_udp_urltest_interval")
         local interval_n = strToInt(interval)
+        if nodes then
         push(config.outbounds, {
             type = "urltest", tag = "main-udp-out",
             outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
@@ -576,8 +651,9 @@ if not isEmpty(main_node) then
             idle_timeout = (interval_n and interval_n > 1800)
                 and (interval_n * 2 .. "s") or nil,
         })
-        for _, l in ipairs(filter(nodes, function(l) return not contains(urltest_nodes, l) end)) do
-            urltest_nodes[#urltest_nodes + 1] = l
+            for _, l in ipairs(filter(nodes, function(l) return not contains(urltest_nodes, l) end)) do
+                urltest_nodes[#urltest_nodes + 1] = l
+            end
         end
     elseif dedicated_udp_node then
         local ncfg = uci:get_all(UCICONFIG, main_udp_node) or {}
@@ -595,21 +671,43 @@ elseif not isEmpty(default_outbound) then
     uci:foreach(UCICONFIG, UCIROUTINGNODE, function(cfg)
         if cfg.enabled ~= "1" then return end
         if cfg.node == "urltest" then
+            local ut_nodes = cfg.urltest_nodes
+            if type(ut_nodes) ~= "table" then ut_nodes = ut_nodes and { ut_nodes } or {} end
+            ut_nodes = filter_node_list(ut_nodes, "routing_node " .. tostring(cfg[".name"]))
+            if #ut_nodes == 0 then
+                io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
+                    .. " has an empty urltest_nodes list -- skipped.\n")
+                return
+            end
             push(config.outbounds, {
                 type = "urltest", tag = "cfg-" .. cfg[".name"] .. "-out",
-                outbounds = map(cfg.urltest_nodes, function(k) return "cfg-" .. k .. "-out" end),
+                outbounds = map(ut_nodes, function(k) return "cfg-" .. k .. "-out" end),
                 url = cfg.urltest_url, interval = strToTime(cfg.urltest_interval),
                 tolerance = strToInt(cfg.urltest_tolerance),
                 idle_timeout = strToTime(cfg.urltest_idle_timeout),
                 interrupt_exist_connections = strToBool(cfg.urltest_interrupt_exist_connections),
             })
-            for _, l in ipairs(filter(cfg.urltest_nodes, function(l) return not contains(urltest_nodes, l) end)) do
+            for _, l in ipairs(filter(ut_nodes, function(l) return not contains(urltest_nodes, l) end)) do
                 urltest_nodes[#urltest_nodes + 1] = l
             end
         else
-            local ob = uci:get_all(UCICONFIG, cfg.node) or {}
+            -- A missing node must NOT fall through: add_* would push nothing
+            -- and the detour/bind_interface edits below would hit whatever
+            -- outbound happens to be last in the array.
+            local ob = uci:get_all(UCICONFIG, cfg.node)
+            if not ob then
+                io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
+                    .. " references missing node " .. tostring(cfg.node) .. " -- skipped.\n")
+                return
+            end
             if ob.type == "wireguard" then
+                local n = #config.endpoints
                 add_endpoint(ob)
+                if #config.endpoints == n then
+                    io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
+                        .. " node " .. tostring(cfg.node) .. " generated no endpoint -- skipped.\n")
+                    return
+                end
                 local last = config.endpoints[#config.endpoints]
                 last.bind_interface = cfg.bind_interface
                 last.detour = get_outbound(cfg.outbound)
@@ -617,7 +715,13 @@ elseif not isEmpty(default_outbound) then
                     last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
                 end
             else
+                local n = #config.outbounds
                 add_outbound(ob)
+                if #config.outbounds == n then
+                    io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
+                        .. " node " .. tostring(cfg.node) .. " generated no outbound -- skipped.\n")
+                    return
+                end
                 local last = config.outbounds[#config.outbounds]
                 last.bind_interface = cfg.bind_interface
                 last.detour = get_outbound(cfg.outbound)
@@ -712,6 +816,10 @@ elseif not isEmpty(default_outbound) then
             update_interval = cfg.update_interval,
         })
     end)
+else
+    -- Neither a main node nor a default_outbound: sing-box still requires a
+    -- route.final, so fall back to direct rather than emitting broken JSON.
+    config.route.final = "direct-out"
 end
 
 -- Materialize an outbound for EVERY node (cfg-<sect>-out) so the Clash API
@@ -730,6 +838,10 @@ if os.getenv("HP_MATERIALIZE_ALL_NODES") ~= "0" then
     uci:foreach(UCICONFIG, UCINODE, function(cfg)
         local tag = "cfg-" .. cfg[".name"] .. "-out"
         if has_outbound(tag) then return end
+        -- Group/pseudo types have no single-server outbound form; skipping
+        -- them keeps one stray node from failing `sing-box check`.
+        if cfg.type == "urltest" or cfg.type == "selector" or cfg.type == "direct"
+            or cfg.type == "block" or cfg.type == "dns" then return end
         if cfg.type == "wireguard" then add_endpoint(cfg, tag)
         else add_outbound(cfg, tag) end
     end)
@@ -749,4 +861,7 @@ if routing_mode == "bypass_mainland_china" or routing_mode == "custom" then
 end
 
 hp.mkdir_p(hp.RUN_DIR)
-hp.writefile(hp.RUN_DIR .. "/sing-box-c.json", hp.encode_json(config))
+if not hp.writefile(hp.RUN_DIR .. "/sing-box-c.json", hp.encode_json(config)) then
+    io.stderr:write("homeproxy: ERROR: failed to write " .. hp.RUN_DIR .. "/sing-box-c.json\n")
+    os.exit(1)
+end

@@ -109,13 +109,26 @@ def is_ip6(s):
 
 
 def is_hostname(s):
-    if not s:
+    """Faithful replica of homeproxy.lua is_hostname (post-hardening):
+    rejects empty labels (a..b, .x, x.), >253 total, >63 labels, leading/
+    trailing hyphens in labels, and pure-numeric dotted strings."""
+    if not s or len(s) > 253:
         return False
-    if re.match(r"^[a-zA-Z0-9_]+$", s):
-        return True
-    if re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_%.\-]*[a-zA-Z0-9_]$", s) and re.search(r"[^0-9.]", s):
-        return True
-    return False
+    if s.startswith(".") or s.endswith(".") or ".." in s:
+        return False
+    if "." not in s:
+        # Single label follows the same label rules (interior hyphens OK).
+        if len(s) > 63:
+            return False
+        return re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-]*[a-zA-Z0-9_]$", s) is not None \
+            or re.match(r"^[a-zA-Z0-9_]$", s) is not None
+    for label in s.split("."):
+        if len(label) == 0 or len(label) > 63:
+            return False
+        if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-]*[a-zA-Z0-9_]$", label) \
+                and not re.match(r"^[a-zA-Z0-9_]$", label):
+            return False
+    return re.search(r"[^0-9.]", s) is not None
 
 
 def validation(datatype, data):
@@ -575,5 +588,21 @@ def run_tests():
         sys.exit(1)
 
 
+def check_hostname_replica():
+    """Lock the Python replica to the hardened Lua is_hostname contract."""
+    good = ["example.com", "a.b-c.example.org", "localhost", "node_1.example.com",
+            "xn--fsq.com", "a" * 63 + ".com", "my-router", "DESKTOP-PC", "a-b"]
+    bad = ["", ".example.com", "example.com.", "a..b", "-bad.example.com",
+           "bad-.example.com", "exa mple.com", "a" * 64 + ".com",
+           "123.456", "ex/ample.com", "exam_ple.com x", "-single", "single-",
+           "a" * 64]
+    for h in good:
+        assert is_hostname(h), f"valid hostname rejected: {h}"
+    for h in bad:
+        assert not is_hostname(h), f"invalid hostname accepted: {h!r}"
+    print("hostname replica checks: PASS")
+
+
 if __name__ == "__main__":
+    check_hostname_replica()
     run_tests()
