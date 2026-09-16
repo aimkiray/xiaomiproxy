@@ -8,7 +8,9 @@
 #       SRC   local path/dir or URL of a tarball holding the repo root/ tree.
 #             Overrides HP_SRC_URL. Required if no HP_SRC_URL env.
 #   env: HP_SRC_URL          tarball URL (github release / own host)
+#        HP_DOWNLOAD_SHA256  sha256 of the source tarball (verified if set)
 #        HP_SINGBOX_URL      sing-box tar URL (default: 1.13.15 linux arm64)
+#        HP_SINGBOX_SHA256   sha256 of the sing-box tarball (verified if set)
 #        HP_CONFIRM_TIMEOUT  verify window before auto-rollback (default 30)
 #        HP_FORCE_CONFIG     non-empty -> overwrite existing UCI config too
 #
@@ -45,8 +47,14 @@ mkdir -p /var/run/homeproxy 2>/dev/null
 log() { echo "[hp-install] $*"; }
 die() { echo "[hp-install] ERROR: $*" >&2; exit 1; }
 
+# Single-flight: a second concurrent install would race on $WORK/$BACKUP_TAR
+# and the in-place file swaps. mkdir is atomic on busybox.
+LOCK=/tmp/homeproxy-install.lock
+mkdir "$LOCK" 2>/dev/null || die "another install is already running (lock: $LOCK)"
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
 # fetch <url> <out_file>  (curl preferred, wget fallback)
-# Enforces HTTPS-only (C5) and verifies checksum if HP_DOWNLOAD_SHA256 is set (C2).
+# Enforces HTTPS-only (C5). Callers verify integrity via verify_checksum (C2).
 fetch() {
     url=$1; out=$2
     # Reject non-HTTPS URLs to prevent MITM on cleartext downloads (C5).
@@ -261,7 +269,10 @@ if [ "$sb_want" = 1 ]; then
     safe_extract /tmp/hp_sb/sb.tar.gz /tmp/hp_sb
     sb=$(find /tmp/hp_sb -type f -name sing-box | head -n1)
     [ -n "$sb" ] || die "sing-box binary not found in archive"
-    # mv over the old binary is atomic; a running sing-box keeps its inode.
+    chmod 755 "$sb"
+    # Sanity-run before swapping: a truncated/corrupt download must never
+    # replace a working binary (mv below is a cross-device copy, not atomic).
+    "$sb" version >/dev/null 2>&1 || die "downloaded sing-box fails to execute -- keeping existing binary"
     mv -f "$sb" "$SINGBOX"; chmod 755 "$SINGBOX"
     rm -rf /tmp/hp_sb
     log "sing-box installed: $SINGBOX"
@@ -272,11 +283,12 @@ fi
 WORK=/tmp/hp_install_src
 rm -rf "$WORK" /tmp/hp_sb; mkdir -p "$WORK"
 # EXIT trap: clean temp dirs always; trigger rollback if upgrade failed mid-way (C4).
-trap 'rm -rf "$WORK" /tmp/hp_sb 2>/dev/null; [ "$DONE" = 0 ] && [ "${UPGRADE:-0}" = 1 ] && do_rollback' EXIT
+trap 'rm -rf "$WORK" /tmp/hp_sb 2>/dev/null; [ "$DONE" = 0 ] && [ "${UPGRADE:-0}" = 1 ] && do_rollback; rmdir "$LOCK" 2>/dev/null' EXIT
 case "$SRC" in
     https://*)
         log "downloading source: $SRC"
         fetch "$SRC" "$WORK/src.tar.gz"
+        verify_checksum "$WORK/src.tar.gz" "${HP_DOWNLOAD_SHA256:-}"
         safe_extract "$WORK/src.tar.gz" "$WORK"
         ;;
     *)

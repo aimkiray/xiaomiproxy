@@ -185,7 +185,9 @@ config)
 		local values = {}
 		for name, s in pairs(uci:get_all("homeproxy") or {}) do
 			local t = s[".type"]
-			local keep = t and KEEP[t]
+			-- singleton sections are matched by NAME (their .type is the
+			-- generic "homeproxy"); node sections are matched by TYPE.
+			local keep = KEEP[name] or (t and KEEP[t])
 			if keep then
 				local proj = { [".type"] = t }
 				for k in pairs(keep) do
@@ -373,7 +375,7 @@ set_dns)
 			# Split host/port: bracketed IPv6 may carry :port after ']';
 			# unbracketed multi-colon is unparseable -> reject.
 			case "$dha" in
-				\[*\]) dh=${dha#\[}; dh=${dh%%\]*}; dport=${dha#*\]}; dport=${dport#:} ;;
+				\[*\]*) dh=${dha#\[}; dh=${dh%%\]*}; dport=${dha#*\]}; dport=${dport#:} ;;
 				*:*:*) json_err "IPv6 DNS host must be [bracketed]: $dha" ;;
 				*:*)   dh=${dha%%:*}; dport=${dha##*:} ;;
 				*)     dh=$dha; dport= ;;
@@ -474,7 +476,12 @@ subscribe)
 	# The updater commits UCI and restarts the service itself when the node
 	# set changed -- restarting here too would bounce sing-box twice.
 	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
-	if HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/update_subscriptions.lua" >"$tmp" 2>&1; then
+	# Run the node-name migration first (same ordering as CLI/cron): without
+	# it, an update fired between a package upgrade and the first service
+	# start treats old-style node sections as foreign and rebuilds them,
+	# losing the selected main_node.
+	if HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/migrate_config.lua" >>"$tmp" 2>&1 \
+		&& HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/update_subscriptions.lua" >>"$tmp" 2>&1; then
 		tail -n 20 "$tmp" 2>/dev/null > "$tmp.short"
 		hdr 'Content-Type: application/json'
 		printf '{"ok":true,"output":"%s"}\n' "$(jesc "$(cat "$tmp.short" 2>/dev/null)")"

@@ -243,7 +243,9 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
 		echo "homeproxy: FATAL: failed to create CN ipset (ipset binary or kmod missing?). Aborting." >&2
 		stop_fw; exit 1
 	}
-	[ "$ipv6" = "1" ] && build_ipset homeproxy_cn6 "$RES_DIR/china_ip6.txt" inet6
+	if [ "$ipv6" = "1" ] && ! build_ipset homeproxy_cn6 "$RES_DIR/china_ip6.txt" inet6; then
+		echo "homeproxy: WARNING: v6 CN ipset missing -- rules referencing it will not be installed (v6 falls through to the catch-all)." >&2
+	fi
 	cn_cnt=$(ipset list homeproxy_cn4 2>/dev/null | awk '/Number of entries/{print $4}')
 	[ -z "$cn_cnt" ] && cn_cnt=0
 	[ "$cn_cnt" -le 0 ] && {
@@ -268,18 +270,32 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
 fi
 
 if [ "$routing_mode" = "gfwlist" ]; then
-	build_ipset_empty homeproxy_gfw4 inet hash:ip
-	[ "$ipv6" = "1" ] && build_ipset_empty homeproxy_gfw6 inet6 hash:ip
+	# A missing gfw4 set is fatal, not just silent: the `! --match-set` RETURN
+	# rule never installs, inverting gfwlist into proxy-everything.
+	build_ipset_empty homeproxy_gfw4 inet hash:ip || {
+		echo "homeproxy: FATAL: failed to create gfw ipset -- gfwlist cannot steer traffic. Aborting." >&2
+		stop_fw; exit 1
+	}
+	if [ "$ipv6" = "1" ] && ! build_ipset_empty homeproxy_gfw6 inet6 hash:ip; then
+		echo "homeproxy: WARNING: v6 gfw ipset missing -- v6 gfwlist rules will not be installed." >&2
+	fi
 	[ -s "$RES_DIR/gfw_list.txt" ] || \
 		echo "homeproxy: WARNING: gfw_list.txt missing/empty -- gfwlist will proxy nothing (all direct)." >&2
 fi
 
 # wan_proxy / wan_direct: always created (even empty) so dnsmasq ipset= can
-# populate wan_proxy dynamically from proxy_list.txt.
-load_list_ipset homeproxy_wan_proxy4 inet "$(wan_proxy_ipv4)"
-[ "$ipv6" = "1" ] && load_list_ipset homeproxy_wan_proxy6 inet6 "$(wan_proxy_ipv6)"
-load_list_ipset homeproxy_wan_direct4 inet "$(wan_direct_ipv4)"
-[ "$ipv6" = "1" ] && load_list_ipset homeproxy_wan_direct6 inet6 "$(wan_direct_ipv6)"
+# populate wan_proxy dynamically from proxy_list.txt. A failed create leaves
+# rules referencing the set uninstalled -- warn so the feature loss is visible.
+load_list_ipset homeproxy_wan_proxy4 inet "$(wan_proxy_ipv4)" || \
+	echo "homeproxy: WARNING: wan_proxy4 ipset missing -- always-proxy list rules disabled." >&2
+if [ "$ipv6" = "1" ] && ! load_list_ipset homeproxy_wan_proxy6 inet6 "$(wan_proxy_ipv6)"; then
+	echo "homeproxy: WARNING: wan_proxy6 ipset missing." >&2
+fi
+load_list_ipset homeproxy_wan_direct4 inet "$(wan_direct_ipv4)" || \
+	echo "homeproxy: WARNING: wan_direct4 ipset missing -- always-direct list rules disabled." >&2
+if [ "$ipv6" = "1" ] && ! load_list_ipset homeproxy_wan_direct6 inet6 "$(wan_direct_ipv6)"; then
+	echo "homeproxy: WARNING: wan_direct6 ipset missing." >&2
+fi
 
 cnset4=homeproxy_cn4
 cnset6=homeproxy_cn6

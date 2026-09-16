@@ -203,11 +203,23 @@ start_service() {
     # where needed, populates an ipset the firewall matches against. The
     # firewall.sh run above already created those ipsets.
     if [ "$outbound_node" != "nil" ]; then
-        local hp_ipv6 hp_dns_port gfw_v6="" wan_v6="" wan_direct_v6=""
-        config_get_bool hp_ipv6 "config" "ipv6_support" "0"
+        local hp_dns_port
         config_get hp_dns_port "infra" "dns_port" "5333"
-        [ "$hp_ipv6" = "1" ] && { gfw_v6=",homeproxy_gfw6"; wan_v6=",homeproxy_wan_proxy6"; wan_direct_v6=",homeproxy_wan_direct6"; }
         mkdir -p /tmp/dnsmasq.d
+        # Emit ipset= directives only for sets that actually exist: when
+        # lan_proxy_mode=disabled (or firewall.sh failed) no sets were
+        # created, and dnsmasq would log an error for EVERY query that
+        # resolves into a missing set.
+        local gfw_sets="" wan_sets="" wand_sets="" _s
+        for _s in homeproxy_gfw4 homeproxy_gfw6; do
+            ipset list "$_s" >/dev/null 2>&1 && gfw_sets="${gfw_sets:+$gfw_sets,}$_s"
+        done
+        for _s in homeproxy_wan_proxy4 homeproxy_wan_proxy6; do
+            ipset list "$_s" >/dev/null 2>&1 && wan_sets="${wan_sets:+$wan_sets,}$_s"
+        done
+        for _s in homeproxy_wan_direct4 homeproxy_wan_direct6; do
+            ipset list "$_s" >/dev/null 2>&1 && wand_sets="${wand_sets:+$wand_sets,}$_s"
+        done
         case "$routing_mode" in
         "bypass_mainland_china"|"custom"|"global")
             # forward ALL queries to sing-box DNS; sing-box splits CN/non-CN.
@@ -215,8 +227,8 @@ start_service() {
             ;;
         "gfwlist")
             if [ -s "$HP_DIR/resources/gfw_list.txt" ]; then
-                awk -v dp="$hp_dns_port" -v v6="$gfw_v6" \
-                    '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_gfw4"v6}' \
+                awk -v dp="$hp_dns_port" -v st="$gfw_sets" \
+                    '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; if (length(st)) print "ipset=/"$0"/"st}' \
                     "$HP_DIR/resources/gfw_list.txt" > /tmp/dnsmasq.d/homeproxy_gfw.conf
             else
                 log "Warning: gfw_list.txt missing -- gfwlist mode will not split traffic."
@@ -234,16 +246,16 @@ start_service() {
         esac
         # proxy_list.txt: always-proxy domains -> sing-box DNS + wan_proxy ipset.
         if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/proxy_list.txt" ]; then
-            awk -v dp="$hp_dns_port" -v v6="$wan_v6" \
-                '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; print "ipset=/"$0"/homeproxy_wan_proxy4"v6}' \
+            awk -v dp="$hp_dns_port" -v st="$wan_sets" \
+                '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; if (length(st)) print "ipset=/"$0"/"st}' \
                 "$HP_DIR/resources/proxy_list.txt" > /tmp/dnsmasq.d/homeproxy_proxy_list.conf
         fi
         # direct_list.txt: always-direct domains -> add to wan_direct ipset so the
         # firewall steers them direct (RETURN) regardless of routing mode. No
         # server= redirect: let them resolve normally and force-direct by ipset.
-        if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/direct_list.txt" ]; then
-            awk -v v6="$wan_direct_v6" \
-                '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "ipset=/"$0"/homeproxy_wan_direct4"v6}' \
+        if [ "$routing_mode" != "custom" ] && [ -n "$wand_sets" ] && [ -s "$HP_DIR/resources/direct_list.txt" ]; then
+            awk -v st="$wand_sets" \
+                '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "ipset=/"$0"/"st}' \
                 "$HP_DIR/resources/direct_list.txt" > /tmp/dnsmasq.d/homeproxy_direct_list.conf
         fi
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
@@ -259,6 +271,9 @@ stop_service() {
         /etc/init.d/cron restart >/dev/null 2>&1
     fi
 
+    # The 2>> redirect below fails (and silently skips the whole teardown)
+    # when RUN_DIR is absent, e.g. after an unexpected /var/run cleanup.
+    mkdir -p "$RUN_DIR"
     sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
     rm -f "$RUN_DIR/firewall.active"
 

@@ -247,6 +247,6 @@ set) shift; cmd_set "$@" ;;
 get) cmd_get "$2" ;;
 show) uci -q show "$CONF" ;;
 log) if [ "$2" = "-f" ]; then tail -F "$LOG_PATH" 2>/dev/null || echo "no log yet"; else tail -n 50 "$LOG_PATH" 2>/dev/null || echo "no log yet"; fi ;;
-""|-h|--help|help) sed -n '4,23p' "$0" 2>/dev/null ;;
+""|-h|--help|help) sed -n '4,24p' "$0" 2>/dev/null ;;
 *) die "unknown command '$1' (try: homeproxy help)" ;;
 esac
