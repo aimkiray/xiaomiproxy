@@ -197,10 +197,11 @@ local function is_local_url(url)
 	local u = hp.parseURL(url)
 	local h = u and u.hostname or nil
 	if not h then return false end
+	h = h:gsub("^%[(.*)%]$", "%1")
 	return h == "localhost"
 		or h:match("^127%.") or h:match("^169%.254%.")
-		or h == "0.0.0.0" or h == "::" or h == "::1" or h == "[::1]"
-		or h:lower():match("^fe80:") or h:lower():match("^[fc][cd]")
+		or h == "0.0.0.0" or h == "::" or h == "::1"
+		or h:lower():match("^fe80:") or h:lower():match("^[fc][cd]%x*:")
 end
 
 -- Prune gone node names out of a urltest list UCI option; returns

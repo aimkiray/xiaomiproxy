@@ -95,7 +95,7 @@ is_hostname() {
 # and blind router-side fetches of them are pure SSRF surface).
 is_local_addr() {
 	case "$1" in
-		""|0.0.0.0|::|::1|0:0:0:0:0:0:0:1|127.*|169.254.*|[fF][eE]80:*|[fF][cCdD]*) return 0 ;;
+		""|0.0.0.0|::|::1|0:0:0:0:0:0:0:1|127.*|169.254.*|[fF][eE]80:*|[fF][cCdD]*:*) return 0 ;;
 		*) return 1 ;;
 	esac
 }

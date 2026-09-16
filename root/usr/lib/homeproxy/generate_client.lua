@@ -97,7 +97,7 @@ local ntp_server = uget(UCIINFRA, "ntp_server") or "time.apple.com"
 local ipv6_support = uget(UCIMAIN, "ipv6_support") or "0"
 
 local main_node, main_udp_node, dedicated_udp_node, default_outbound, default_outbound_dns,
-      domain_strategy, dns_server, china_dns_server, dns_default_strategy,
+      domain_strategy, dns_server, dns_server_proto, china_dns_server, dns_default_strategy,
       dns_default_server, dns_disable_cache, dns_disable_cache_expire, dns_independent_cache,
       dns_client_subnet, cache_file_store_rdrc, cache_file_rdrc_timeout,
       direct_domain_list, proxy_domain_list
@@ -105,13 +105,33 @@ local main_node, main_udp_node, dedicated_udp_node, default_outbound, default_ou
 if routing_mode ~= "custom" then
     main_node = uget(UCIMAIN, "main_node") or "nil"
     main_udp_node = uget(UCIMAIN, "main_udp_node") or "nil"
+
+    -- A main_node/main_udp_node pointing at a deleted section would emit
+    -- route.final="main-out" / a udp rule with no such outbound -> sing-box
+    -- check fails and the whole service refuses to start. Fall back instead.
+    local function node_exists(name)
+        local s = not isEmpty(name) and uci:get_all(UCICONFIG, name) or nil
+        return type(s) == "table" and s[".type"] == "node"
+    end
+    if main_node ~= "urltest" and not isEmpty(main_node) and not node_exists(main_node) then
+        io.stderr:write("homeproxy: WARNING: main_node '" .. tostring(main_node)
+            .. "' does not exist -- falling back to direct.\n")
+        main_node = "nil"
+    end
+
     dedicated_udp_node = not isEmpty(main_udp_node)
         and main_udp_node ~= "same" and main_udp_node ~= main_node
+    if dedicated_udp_node and main_udp_node ~= "urltest" and not node_exists(main_udp_node) then
+        io.stderr:write("homeproxy: WARNING: main_udp_node '" .. tostring(main_udp_node)
+            .. "' does not exist -- UDP falls back to the main node.\n")
+        main_udp_node = "same"
+        dedicated_udp_node = false
+    end
 
     dns_server = uget(UCIMAIN, "dns_server")
     -- Bare "wan"/unset means the ISP resolver -- plain UDP; DoH would fail.
     -- An explicit bare IP keeps the deliberate DoH upgrade (see main-dns).
-    local dns_server_proto = "https"
+    dns_server_proto = "https"
     if isEmpty(dns_server) or dns_server == "wan" then
         dns_server = wan_dns
         dns_server_proto = "udp"
@@ -694,8 +714,10 @@ elseif not isEmpty(default_outbound) then
             -- A missing node must NOT fall through: add_* would push nothing
             -- and the detour/bind_interface edits below would hit whatever
             -- outbound happens to be last in the array.
-            local ob = uci:get_all(UCICONFIG, cfg.node)
-            if not ob then
+            -- cfg.node nil -> get_all returns the whole package (truthy);
+            -- a nonexistent/non-node name yields nil or a foreign section.
+            local ob = not isEmpty(cfg.node) and uci:get_all(UCICONFIG, cfg.node) or nil
+            if type(ob) ~= "table" or ob[".type"] ~= "node" then
                 io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
                     .. " references missing node " .. tostring(cfg.node) .. " -- skipped.\n")
                 return

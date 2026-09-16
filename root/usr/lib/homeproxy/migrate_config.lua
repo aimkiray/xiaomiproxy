@@ -140,4 +140,9 @@ if uci:get_all(CFG, "experimental") then
     uci:delete(CFG, "experimental")
 end
 
-if changed() then uci:commit(CFG) end
+if changed() then
+    if not uci:commit(CFG) then
+        io.stderr:write("homeproxy: migration commit failed\n")
+        os.exit(1)
+    end
+end
