@@ -165,6 +165,7 @@ config)
 	# node credential/private key/github token to any LAN client. Only the
 	# fields the UI actually reads are emitted, per section type.
 	out=$(HP_LUAPATH="$HP_LIB_DIR" lua -e '
+		package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
 		local hp = require("homeproxy")
 		local uci = require("uci").cursor()
 		uci:load("homeproxy")
