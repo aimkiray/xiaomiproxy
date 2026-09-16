@@ -98,7 +98,15 @@ for line in input:gmatch("[^\r\n]+") do
 end
 
 if #added > 0 then
-	uci:commit(CFG)
+	-- Checked commit (same convention as update_subscriptions' commit_uci):
+	-- a full/read-only filesystem must surface as an error, not a fake
+	-- success listing nodes that were never persisted.
+	if not uci:commit(CFG) then
+		io.write(hp.encode_json({ ok = false, error = "uci commit failed",
+			added = {}, skipped = skipped }) .. "\n")
+		io.flush()
+		os.exit(1)
+	end
 end
 
 io.write(hp.encode_json({ ok = true, added = added, skipped = skipped }) .. "\n")

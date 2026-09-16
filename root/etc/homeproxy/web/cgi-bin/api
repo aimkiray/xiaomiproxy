@@ -15,6 +15,7 @@
 #   set_proxy_list   body=domains     -> overwrite proxy_list.txt + restart
 #   set_subscription_urls body=urls    -> replace subscription_url list
 #   set_dns           body=2 lines     -> set dns_server + china_dns_server + restart
+#   add_node          body=links       -> import share links (one per line) as nodes
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
