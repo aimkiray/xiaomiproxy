@@ -481,6 +481,10 @@ apply_tproxy() {
 	# ip rule (fwmark tproxy_mark -> table -> local dev lo) then re-delivers the
 	# packet on lo, where the PREROUTING hook re-enters homeproxy_mangle -> TPROXY.
 	$ip -t mangle -N homeproxy_mangle_mark 2>/dev/null || $ip -t mangle -F homeproxy_mangle_mark
+	# Create the OUTPUT steering chain BEFORE hooking jumps into it: iptables
+	# refuses -j to a chain that does not exist yet ("Couldn't load target"),
+	# which would both spam the log and leave router-self UDP unsteered.
+	emit_steering "$ip" mangle homeproxy_mangle_out "$rset" homeproxy_mangle_mark homeproxy_mangle_mark
 	for _p in $protos; do
 		if [ "$routing_port" = "common" ]; then
 			$ip -t mangle -A homeproxy_mangle_mark -p "$_p" -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
@@ -494,7 +498,6 @@ apply_tproxy() {
 		$ip -t mangle -D PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
 		$ip -t mangle -A PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
 	done
-	emit_steering "$ip" mangle homeproxy_mangle_out "$rset" homeproxy_mangle_mark homeproxy_mangle_mark
 }
 
 # --- TUN steering (mangle MARK) ------------------------------------------
