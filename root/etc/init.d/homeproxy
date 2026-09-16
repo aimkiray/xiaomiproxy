@@ -206,6 +206,9 @@ start_service() {
         local hp_dns_port
         config_get hp_dns_port "infra" "dns_port" "5333"
         mkdir -p /tmp/dnsmasq.d
+        # Drop stale confs first: a routing-mode switch or a now-missing
+        # ipset would otherwise leave last run's directives behind.
+        rm -f /tmp/dnsmasq.d/homeproxy_*.conf
         # Emit ipset= directives only for sets that actually exist: when
         # lan_proxy_mode=disabled (or firewall.sh failed) no sets were
         # created, and dnsmasq would log an error for EVERY query that
