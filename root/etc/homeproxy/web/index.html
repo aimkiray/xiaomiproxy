@@ -112,6 +112,15 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
  </div>
 
  <div class="card">
+  <h2>Add nodes</h2>
+  <div class="row" style="align-items:flex-start">
+   <textarea id="nodeLinks" rows="4" placeholder="paste share links, one per line (ss:// vmess:// vless:// trojan:// hysteria2:// anytls:// socks:// http://)"></textarea>
+   <button id="applyNodeLinks" class="ghost">Add</button>
+  </div>
+  <div class="sub" style="margin-top:8px">Manually added nodes are never removed by subscription updates.</div>
+ </div>
+
+ <div class="card">
   <h2>DNS servers</h2>
   <div class="row">
    <label>Proxy DNS</label>
@@ -278,6 +287,7 @@ async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$
 async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
 async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
 async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
+async function applyNodeLinks(){if(busy.applyNodeLinks)return;const v=$('nodeLinks').value.trim();if(!v){toast('paste at least one share link');return}setBusy('applyNodeLinks',true);try{const r=await apiJson('add_node',{method:'POST',body:v});if(r.ok){const n=(r.added||[]).length,s=(r.skipped||[]).length;toast('Added '+n+' node(s)'+(s?(', skipped '+s+' unparsed'):''));if(n){$('nodeLinks').value='';await refresh()}if(s&&r.skipped)console.log('skipped:',r.skipped)}else toast('add failed: '+(r.error||''))}catch(e){toast('add failed: '+e.message)}finally{setBusy('applyNodeLinks',false)}}
 async function applyDns(){
  if(busy.applyDns)return;setBusy('applyDns',true);
  const p=$('proxyDns').value,c=$('chinaDns').value;
@@ -308,6 +318,7 @@ $('applyLanProxy').onclick=applyLanProxy;
 $('applyDirect').onclick=applyDirectList;
 $('applyProxy').onclick=applyProxyList;
 $('applySubUrls').onclick=applySubUrls;
+$('applyNodeLinks').onclick=applyNodeLinks;
 $('applyDns').onclick=applyDns;
 $('dnsPreset').onchange=function(){if(this.value)$('proxyDns').value=this.value};
 $('cnDnsPreset').onchange=function(){if(this.value)$('chinaDns').value=this.value};

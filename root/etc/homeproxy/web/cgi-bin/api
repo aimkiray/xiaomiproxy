@@ -136,7 +136,7 @@ esac
 # Write endpoints require POST -- this is an unauthenticated LAN API, so
 # guard against an accidental GET clearing a list or triggering a restart.
 case "$Q_action" in
-	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|set_dns|subscribe|restart)
+	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|set_dns|subscribe|restart|add_node)
 		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})"
 		case "${CONTENT_TYPE:-}" in
 			application/json*) : ;;
@@ -196,6 +196,15 @@ config)
 		io.write(hp.encode_json({ ok = true, values = values }))
 	' 2>/dev/null)
 	[ -n "$out" ] || json_err "config read failed"
+	json_ok "$out"
+	;;
+
+add_node)
+	# Body: share links, one per line. Parsed by add_nodes.lua and upserted as
+	# UCI node sections (no grouphash -> immune to subscription GC).
+	require_body_size
+	out=$(read_body | HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/add_nodes.lua" 2>/dev/null)
+	[ -n "$out" ] || json_err "node import failed"
 	json_ok "$out"
 	;;
 
@@ -487,7 +496,7 @@ log)
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns ping_nodes connectivity subscribe restart log"
+	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns add_node ping_nodes connectivity subscribe restart log"
 	;;
 
 *)

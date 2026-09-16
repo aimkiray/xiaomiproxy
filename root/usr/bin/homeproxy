@@ -16,6 +16,7 @@
 #   proxy-mode [mode]                  get/set proxy_mode
 #   lan-proxy [mode]                    get/set lan_proxy_mode
 #   add <label> -- <type> <addr> <port> [key=val ...]
+#   import <share-link> [...]           add nodes from ss:// vmess:// vless:// etc.
 #   del <name>                          delete a node
 #   set <section.option> <value>       set a uci option
 #   get <section.option>                get a uci option
@@ -240,6 +241,7 @@ lan-proxy)
         uci_set "control.lan_proxy_mode" "$2" || die "set failed"; echo "lan_proxy_mode=$2"
     fi ;;
 add) shift; cmd_add "$@" ;;
+import) shift; [ $# -ge 1 ] || die "usage: homeproxy import <share-link> [more links...]"; printf '%s\n' "$@" | lua "$LUA_DIR/add_nodes.lua" ;;
 del) cmd_del "$2" ;;
 set) shift; cmd_set "$@" ;;
 get) cmd_get "$2" ;;
