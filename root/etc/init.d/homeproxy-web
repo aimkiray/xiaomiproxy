@@ -56,3 +56,9 @@ reload_service() {
 	stop
 	start
 }
+
+# uhttpd binds the resolved LAN IP at start; when the lan interface comes up
+# or readdresses, rebind so the UI stays reachable on the new address.
+service_triggers() {
+	procd_add_interface_trigger "interface.*.up" lan /etc/init.d/homeproxy-web reload
+}

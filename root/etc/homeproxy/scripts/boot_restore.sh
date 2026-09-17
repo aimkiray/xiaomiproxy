@@ -47,8 +47,14 @@ elif [ -d /etc/homeproxy ] && [ -d "$HP" ]; then
 	# A REAL directory blocks the symlink: something like a premature
 	# `mkdir -p /etc/homeproxy/resources` (update_resources.sh runs before
 	# the restore on a boot race) created it, and the old `-e` check then
-	# skipped the link forever. Preserve anything inside, then replace.
-	cp -a /etc/homeproxy/. "$HP/" 2>/dev/null || log "WARN: could not merge stale /etc/homeproxy contents."
+	# skipped the link forever. Merge contents in WITHOUT clobbering files
+	# already on persistent storage -- `cp -a` would overwrite the
+	# authoritative copies with stale ramfs ones.
+	if (cd /etc/homeproxy && tar -cf - . 2>/dev/null) | (cd "$HP" && tar -xkf - 2>/dev/null); then
+		log "merged stale /etc/homeproxy into $HP (existing files kept)"
+	else
+		log "WARN: could not merge stale /etc/homeproxy contents."
+	fi
 	rm -rf /etc/homeproxy
 	ln -sfn "$HP" /etc/homeproxy 2>/dev/null
 	log "replaced real /etc/homeproxy dir with symlink -> $HP"

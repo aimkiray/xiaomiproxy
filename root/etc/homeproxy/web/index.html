@@ -273,20 +273,20 @@ async function testConn(){
 
 async function applyNode(){
  if(busy.applyNode)return;const v=$('node').value;setBusy('applyNode',true);
- try{const r=await apiJson('set_main_node',{method:'POST',body:v});toast(r.ok?'Main node set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyNode',false)}
+ try{const r=await apiJson('set_main_node',{method:'POST',body:v});toast(r.ok?'Main node set':('failed: '+(r.error||'')));await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyNode',false)}
 }
 async function applyMode(){
  if(busy.applyMode)return;const v=$('mode').value;setBusy('applyMode',true);
- try{const r=await apiJson('set_routing_mode',{method:'POST',body:v});toast(r.ok?'Routing mode set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyMode',false)}
+ try{const r=await apiJson('set_routing_mode',{method:'POST',body:v});toast(r.ok?'Routing mode set':('failed: '+(r.error||'')));await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyMode',false)}
 }
 async function applyLanProxy(){
  if(busy.applyLanProxy)return;const v=$('lanproxy').value;setBusy('applyLanProxy',true);
- try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':'failed');await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
+ try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':('failed: '+(r.error||'')));await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
 }
 async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||''}catch(e){toast('domain lists: '+e.message)}}
-async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
-async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
-async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):'failed')}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
+async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
+async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
+async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
 async function applyNodeLinks(){if(busy.applyNodeLinks)return;const v=$('nodeLinks').value.trim();if(!v){toast('paste at least one share link');return}setBusy('applyNodeLinks',true);try{const r=await apiJson('add_node',{method:'POST',body:v});if(r.ok){const n=(r.added||[]).length,s=(r.skipped||[]).length;toast('Added '+n+' node(s)'+(s?(', skipped '+s+' unparsed'):''));if(n){$('nodeLinks').value='';await refresh()}if(s&&r.skipped)console.log('skipped:',r.skipped)}else toast('add failed: '+(r.error||''))}catch(e){toast('add failed: '+e.message)}finally{setBusy('applyNodeLinks',false)}}
 async function applyDns(){
  if(busy.applyDns)return;setBusy('applyDns',true);
@@ -294,11 +294,11 @@ async function applyDns(){
  try{const r=await apiJson('set_dns',{method:'POST',body:p+'\n'+c});toast(r.ok?'DNS set, restarting…':'failed: '+(r.error||''));if(r.ok)await refresh()}catch(e){toast('DNS set failed: '+e.message)}finally{setBusy('applyDns',false)}}
 async function doSubscribe(){
  if(busy.btnSub)return;setBusy('btnSub',true);$('actOut').style.display='block';$('actOut').textContent='updating subscription…';
- try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':'subscription failed');await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
+ try{const r=await apiJson('subscribe',{method:'POST'});$('actOut').textContent=r.output||(r.ok?'done':('error: '+(r.error||'')));toast(r.ok?'Subscription updated':('subscription failed: '+(r.error||'')));await refresh()}catch(e){$('actOut').textContent='error: '+e.message}finally{setBusy('btnSub',false)}
 }
 async function doRestart(){
  if(busy.btnRestart)return;setBusy('btnRestart',true);toast('restarting…');
- try{await apiJson('restart',{method:'POST'});toast('proxy restarted');setTimeout(refresh,1500)}catch(e){toast('restart failed: '+e.message)}finally{setBusy('btnRestart',false)}
+ try{const r=await apiJson('restart',{method:'POST'});if(r.ok){toast('proxy restarted');setTimeout(refresh,1500)}else toast('restart failed: '+(r.error||''))}catch(e){toast('restart failed: '+e.message)}finally{setBusy('btnRestart',false)}
 }
 async function loadLog(){
  const t=await api('log',{q:'lines=120'});$('log').textContent=t||'(empty)'

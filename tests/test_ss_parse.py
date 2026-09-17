@@ -603,6 +603,15 @@ def check_hostname_replica():
     print("hostname replica checks: PASS")
 
 
+# pytest entry points: the file predates pytest -- expose the suites.
+def test_hostname_replica():
+    check_hostname_replica()
+
+
+def test_parser_matrix():
+    run_tests()
+
+
 if __name__ == "__main__":
     check_hostname_replica()
     run_tests()

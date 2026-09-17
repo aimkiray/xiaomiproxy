@@ -44,7 +44,11 @@ fetch_url() {
 # parse GitHub commits API json with the on-device lua + luci.json
 parse_verinfo() {
     lua -e '
-local j = require("luci.json").decode(io.read("*a"))
+-- luci.json (encode/decode) preferred; luci.jsonc (parse/stringify) fallback.
+local ok, m = pcall(require, "luci.json")
+if not ok then m = require("luci.jsonc") end
+local decode = m.decode or function(s) return m.parse(s) end
+local j = decode(io.read("*a"))
 j = (j and j[1]) or {}
 local msg = (j.commit and j.commit.message) or ""
 local ver = (msg:match("[0-9%-]+") or ""):gsub("-", "")
@@ -100,11 +104,25 @@ check_list_update() {
         return 1
     fi
 
-    mv -f "$RUN_DIR/$listname" "$RESOURCES_DIR/$listtype.${listname##*.}"
+    # china_list upstream ships "full:domain.tld" tags that the dnsmasq conf
+    # generation would silently skip. Normalize BEFORE installing -- doing it
+    # after the service restart below used to restart onto the unsanitized
+    # file and left the cleanup one restart behind.
+    if [ "$listtype" = "china_list" ]; then
+        sed -i -e "s/full://g" -e "/:/d" "$RUN_DIR/$listname"
+    fi
+    if ! mv -f "$RUN_DIR/$listname" "$RESOURCES_DIR/$listtype.${listname##*.}"; then
+        rm -f "$RUN_DIR/$listname"
+        log "[$(to_upper "$listtype")] Update failed: could not install the list."
+        return 1
+    fi
     # Atomic .ver write (same-dir tmp + mv) so a crash never leaves a
-    # half-written version file behind.
-    printf '%s\n' "$list_ver" > "$RESOURCES_DIR/.$listtype.ver.tmp" && \
-        mv -f "$RESOURCES_DIR/.$listtype.ver.tmp" "$RESOURCES_DIR/$listtype.ver"
+    # half-written version file behind. Only write it after the data file
+    # actually landed -- otherwise a failed install would look up-to-date.
+    if ! { printf '%s\n' "$list_ver" > "$RESOURCES_DIR/.$listtype.ver.tmp" && \
+        mv -f "$RESOURCES_DIR/.$listtype.ver.tmp" "$RESOURCES_DIR/$listtype.ver"; }; then
+        log "[$(to_upper "$listtype")] WARNING: version file write failed; the update will be retried next run."
+    fi
     log "[$(to_upper "$listtype")] Successfully updated."
 
     # The new list only takes effect after ipsets and the dnsmasq steering
@@ -128,8 +146,7 @@ case "$1" in
     check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "gfw.txt"
     ;;
 "china_list")
-    check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "direct-list.txt" && \
-        sed -i -e "s/full://g" -e "/:/d" "$RESOURCES_DIR/china_list.txt"
+    check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "direct-list.txt"
     ;;
 *)
     echo -e "Usage: $0 <china_ip4|china_ip6|gfw_list|china_list>"

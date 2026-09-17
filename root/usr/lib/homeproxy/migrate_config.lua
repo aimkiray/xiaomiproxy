@@ -31,6 +31,10 @@ if uci:get_all(CFG, "infra") then
     ensure("infra", "self_mark", "100")
     ensure("infra", "tproxy_mark", "101")
     ensure("infra", "tun_mark", "102")
+    -- TUN-marked traffic needs a "default dev tun" route while tproxy-marked
+    -- traffic needs "local dev lo" -- they must live in separate tables.
+    ensure("infra", "table_mark", "100")
+    ensure("infra", "tun_table", "102")
     ensure("infra", "tun_name", "singtun0")
     ensure("infra", "ntp_server", "nil")
     -- deprecated

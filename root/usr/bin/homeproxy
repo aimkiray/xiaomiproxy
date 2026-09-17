@@ -108,6 +108,15 @@ cmd_add() {
     case "$port" in ''|*[!0-9]*) die "invalid port: $port" ;; esac
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port"
     name="$(printf '%s' "$label" | md5sum | cut -c1-32)"
+    if uci -q get "$CONF.$name" >/dev/null 2>&1; then
+        # Upsert (same semantics as `homeproxy import`): wipe the old options
+        # first so switching node type can't leave stale fields behind (e.g.
+        # tls_* from a trojan node surviving onto a shadowsocks rewrite).
+        node_exists "$name" || die "section $name exists and is not a node"
+        for opt in $(uci -q show "$CONF.$name" 2>/dev/null | sed -n "s/^$CONF\.$name\.\([^.=]*\)=.*/\1/p"); do
+            uci -q delete "$CONF.$name.$opt" 2>/dev/null
+        done
+    fi
     uci set "$CONF.$name=node" || die "failed to create node section"
     uci set "$CONF.$name.label=$label" || die "uci set label failed"
     uci set "$CONF.$name.type=$type" || die "uci set type failed"

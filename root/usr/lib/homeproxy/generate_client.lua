@@ -119,8 +119,12 @@ if routing_mode ~= "custom" then
         main_node = "nil"
     end
 
+    -- main_udp_node="urltest" names an independent group even when main_node
+    -- is also "urltest" -- the plain ~= comparison would treat them as one
+    -- node and never route UDP to main-udp-out.
     dedicated_udp_node = not isEmpty(main_udp_node)
-        and main_udp_node ~= "same" and main_udp_node ~= main_node
+        and main_udp_node ~= "same"
+        and (main_udp_node == "urltest" or main_udp_node ~= main_node)
     if dedicated_udp_node and main_udp_node ~= "urltest" and not node_exists(main_udp_node) then
         io.stderr:write("homeproxy: WARNING: main_udp_node '" .. tostring(main_udp_node)
             .. "' does not exist -- UDP falls back to the main node.\n")
@@ -233,7 +237,10 @@ local log_level = uget(UCIMAIN, "log_level") or "warn"
 -- config helpers
 local function parse_port(strport)
     if type(strport) ~= "table" or isEmpty(strport) then return nil end
-    return map(strport, function(i) return tonumber(i) end)
+    return map(strport, function(i)
+        local n = strToInt(i)
+        return (n and n >= 0 and n <= 65535) and n or nil
+    end)
 end
 
 local function parse_dnsserver(server_addr, default_protocol)
@@ -410,14 +417,15 @@ local function get_outbound(cfg)
         return map(cfg, function(i) return get_outbound(i) end)
     else
         if cfg == "block-out" or cfg == "direct-out" then return cfg end
-        local node = uget(cfg, "node")
-        if isEmpty(node) then
-            error(cfg .. "'s node is missing, please check your configuration.")
-        elseif node == "urltest" then
-            return "cfg-" .. cfg .. "-out"
-        else
-            return "cfg-" .. node .. "-out"
+        -- cfg names a routing_node section.  The outbound it produces is
+        -- tagged with the routing_node's own name, not the underlying
+        -- node's: two routing_nodes may share one node while carrying
+        -- different bind_interface/detour, so node-name tags would collide.
+        local rn = uci:get_all(UCICONFIG, cfg)
+        if type(rn) ~= "table" or rn[".type"] ~= UCIROUTINGNODE or isEmpty(rn.node) then
+            error(cfg .. " is not a valid routing node, please check your configuration.")
         end
+        return "cfg-" .. cfg .. "-out"
     end
 end
 
@@ -483,7 +491,16 @@ if not isEmpty(main_node) then
     -- single tunnel connection with builtired reconnection, eliminating the
     -- "read response: EOF" errors when the proxy link's TCP connection is
     -- closed by any layer (anytls idle reaping, server NAT, carrier).
-    for k, v in pairs(parse_dnsserver(dns_server, dns_server_proto) or {}) do main_dns[k] = v end
+    local dns_parsed = parse_dnsserver(dns_server, dns_server_proto)
+    if not dns_parsed then
+        -- An unparseable dns_server would emit a server entry without
+        -- type/server and fail sing-box check; degrade to the WAN resolver
+        -- so the service still starts.
+        io.stderr:write("homeproxy: WARNING: dns_server '" .. tostring(dns_server)
+            .. "' is not parseable -- falling back to udp://" .. tostring(wan_dns) .. ".\n")
+        dns_parsed = parse_dnsserver(wan_dns, "udp")
+    end
+    for k, v in pairs(dns_parsed or {}) do main_dns[k] = v end
     push(config.dns.servers, main_dns)
     config.dns.final = "main-dns"
 
@@ -505,7 +522,13 @@ if not isEmpty(main_node) then
             domain_resolver = { server = "default-dns", strategy = "prefer_ipv6" },
             detour = "direct-out",
         }
-        for k, v in pairs(parse_dnsserver(china_dns_server) or {}) do c_dns[k] = v end
+        local c_dns_parsed = parse_dnsserver(china_dns_server)
+        if not c_dns_parsed then
+            io.stderr:write("homeproxy: WARNING: china_dns_server '" .. tostring(china_dns_server)
+                .. "' is not parseable -- falling back to udp://" .. tostring(wan_dns) .. ".\n")
+            c_dns_parsed = parse_dnsserver(wan_dns, "udp")
+        end
+        for k, v in pairs(c_dns_parsed or {}) do c_dns[k] = v end
         push(config.dns.servers, c_dns)
         if proxy_domain_list and #proxy_domain_list > 0 then
             push(config.dns.rules, { rule_set = "proxy-domain", action = "route", server = "main-dns" })
@@ -722,9 +745,13 @@ elseif not isEmpty(default_outbound) then
                     .. " references missing node " .. tostring(cfg.node) .. " -- skipped.\n")
                 return
             end
+            -- Tag with the routing_node's own name so two routing_nodes
+            -- sharing one node still emit distinct entries (get_outbound
+            -- resolves references the same way).
+            local rn_tag = "cfg-" .. cfg[".name"] .. "-out"
             if ob.type == "wireguard" then
                 local n = #config.endpoints
-                add_endpoint(ob)
+                add_endpoint(ob, rn_tag)
                 if #config.endpoints == n then
                     io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
                         .. " node " .. tostring(cfg.node) .. " generated no endpoint -- skipped.\n")
@@ -738,7 +765,7 @@ elseif not isEmpty(default_outbound) then
                 end
             else
                 local n = #config.outbounds
-                add_outbound(ob)
+                add_outbound(ob, rn_tag)
                 if #config.outbounds == n then
                     io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
                         .. " node " .. tostring(cfg.node) .. " generated no outbound -- skipped.\n")
@@ -751,10 +778,13 @@ elseif not isEmpty(default_outbound) then
                     last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
                 end
             end
-            routing_nodes[#routing_nodes + 1] = cfg.node
+            -- Track emitted tags: a node used by a routing_node is still
+            -- materialized under its own cfg-<node>-out tag when a urltest
+            -- group references it.
+            routing_nodes[#routing_nodes + 1] = rn_tag
         end
     end)
-    for _, i in ipairs(filter(urltest_nodes, function(l) return not contains(routing_nodes, l) end)) do
+    for _, i in ipairs(filter(urltest_nodes, function(l) return not contains(routing_nodes, "cfg-" .. l .. "-out") end)) do
         local ncfg = uci:get_all(UCICONFIG, i) or {}
         if ncfg.type == "wireguard" then add_endpoint(ncfg) else add_outbound(ncfg) end
     end

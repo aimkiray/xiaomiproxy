@@ -33,6 +33,10 @@ SINGBOX_DIR=/data/other_vol/bin
 SINGBOX=$SINGBOX_DIR/sing-box
 BACKUP_TAR=/data/other_vol/.hp_install_backup.tar.gz
 BACKUP_META=/data/other_vol/.hp_install_meta.sh
+# The sing-box binary is NOT in BACKUP_TAR (too large for ubifs); keep its
+# previous copy on tmpfs for the duration of the install so a failed swap
+# can be undone.
+SB_BACKUP=/tmp/.hp_singbox_prev
 CONFIRM_FILE=/tmp/hp_install_confirmed
 LOG=/var/run/homeproxy/homeproxy.log
 
@@ -159,6 +163,8 @@ do_rollback() {
     else
         log "no backup -- clean removal done (fresh install)"
     fi
+    # Restore the previous sing-box binary if this install replaced it.
+    restore_singbox
     # Pre-initialize vars to avoid set -u abort on partial BACKUP_META (M from review).
     HP_FW_INC=""; HP_FW_PATH=""; HP_WAS_RUNNING="no"
     if [ -f "$BACKUP_META" ]; then
@@ -189,10 +195,21 @@ do_rollback() {
     rm -f "$CONFIRM_FILE" "$BACKUP_META" "$BACKUP_TAR"
 }
 
+# Restore the pre-install sing-box binary if we stashed one.
+restore_singbox() {
+    if [ -f "$SB_BACKUP" ]; then
+        cp -f "$SB_BACKUP" "$SINGBOX" 2>/dev/null && chmod 755 "$SINGBOX" \
+            && log "sing-box binary restored." \
+            || log "WARN: could not restore sing-box binary."
+        rm -f "$SB_BACKUP"
+    fi
+}
+
 # remove volatile /etc bits only (keep persistent tree for inspection)
 cleanup_volatile() {
     /etc/init.d/homeproxy stop 2>/dev/null
     /etc/init.d/homeproxy-web stop 2>/dev/null
+    restore_singbox
     rm -f /etc/init.d/homeproxy /etc/init.d/homeproxy-web /etc/profile.d/homeproxy.sh
     rm -rf /etc/homeproxy
     uci -q delete firewall.homeproxy 2>/dev/null; uci -q commit firewall
@@ -273,7 +290,15 @@ if [ "$sb_want" = 1 ]; then
     # Sanity-run before swapping: a truncated/corrupt download must never
     # replace a working binary (mv below is a cross-device copy, not atomic).
     "$sb" version >/dev/null 2>&1 || die "downloaded sing-box fails to execute -- keeping existing binary"
-    mv -f "$sb" "$SINGBOX"; chmod 755 "$SINGBOX"
+    # Keep the working binary on tmpfs so rollback can restore it -- the
+    # backup tarball deliberately excludes it (too large for ubifs).
+    [ -x "$SINGBOX" ] && cp -f "$SINGBOX" "$SB_BACKUP" 2>/dev/null
+    mv -f "$sb" "$SINGBOX" || die "failed to install sing-box binary"
+    chmod 755 "$SINGBOX"
+    "$SINGBOX" version >/dev/null 2>&1 || {
+        restore_singbox
+        die "installed sing-box fails to execute -- restored previous binary"
+    }
     rm -rf /tmp/hp_sb
     log "sing-box installed: $SINGBOX"
 fi
@@ -344,7 +369,7 @@ install_file() {  # <src> <dst> <mode> <policy: always|if_missing>
     # Atomic write: copy to temp then rename (H15) — prevents partial files
     # if interrupted (e.g. SIGPIPE from curl|sh mid-copy).
     cp -a "$s" "$d.tmp" 2>/dev/null || cp "$s" "$d.tmp" || die "copy failed: $s -> $d"
-    mv "$d.tmp" "$d"
+    mv "$d.tmp" "$d" || die "rename failed: $d.tmp -> $d"
     chmod "$m" "$d"
 }
 
@@ -408,18 +433,48 @@ log "starting services..."
 /etc/init.d/homeproxy-web start >>"$LOG" 2>&1
 
 # -- verify within TIMEOUT seconds -----------------------------------------
-log "verifying sing-box start (${TIMEOUT}s)..."
+# A stock-config install legitimately runs no sing-box instance (no node
+# configured, server disabled) -- "installed, awaiting configuration" is a
+# success state, so verify the web UI instead of a process that will never
+# exist. Mirrors the start conditions in init.d/homeproxy.
+need_singbox=0
+if [ "$(uci -q get homeproxy.server.enabled 2>/dev/null)" = "1" ]; then
+    need_singbox=1
+elif [ "$(uci -q get homeproxy.config.routing_mode 2>/dev/null)" = "custom" ]; then
+    _o=$(uci -q get homeproxy.routing.default_outbound 2>/dev/null)
+    [ -n "$_o" ] && [ "$_o" != "nil" ] && need_singbox=1
+else
+    _o=$(uci -q get homeproxy.config.main_node 2>/dev/null)
+    [ -n "$_o" ] && [ "$_o" != "nil" ] && need_singbox=1
+fi
+# Upgrades: a previously running sing-box must come back regardless.
+[ "$HP_WAS_RUNNING" = "yes" ] && need_singbox=1
+
 ok=0; i=0
-while [ "$i" -lt "$TIMEOUT" ]; do
-    if pgrep -f 'sing-box run --config' >/dev/null 2>&1; then ok=1; break; fi
-    sleep 1; i=$((i+1))
-done
+if [ "$need_singbox" = 0 ]; then
+    log "no node/server configured -- verifying web UI instead of sing-box..."
+    while [ "$i" -lt "$TIMEOUT" ]; do
+        if pgrep -f 'uhttpd.*homeproxy' >/dev/null 2>&1; then ok=1; break; fi
+        sleep 1; i=$((i+1))
+    done
+    [ "$ok" = 1 ] && log "installed (unconfigured): web UI up, add a node to start proxying."
+else
+    log "verifying sing-box start (${TIMEOUT}s)..."
+    while [ "$i" -lt "$TIMEOUT" ]; do
+        if pgrep -f 'sing-box run --config' >/dev/null 2>&1; then ok=1; break; fi
+        sleep 1; i=$((i+1))
+    done
+fi
 
 if [ "$ok" = 1 ]; then
     touch "$CONFIRM_FILE"
-    rm -f "$BACKUP_TAR" "$BACKUP_META"
+    rm -f "$BACKUP_TAR" "$BACKUP_META" "$SB_BACKUP"
     lip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.31.1)
-    log "OK sing-box running. install/upgrade complete."
+    if [ "$need_singbox" = 1 ]; then
+        log "OK sing-box running. install/upgrade complete."
+    else
+        log "OK install complete (proxy starts once a node is configured)."
+    fi
     log "  CLI: $BIN/homeproxy"
     log "  Web: http://${lip}:8910/"
     log "  Log: $LOG (tail -f)"
@@ -427,7 +482,11 @@ if [ "$ok" = 1 ]; then
     exit 0
 fi
 
-log "FAILED: sing-box did not start within ${TIMEOUT}s."
+if [ "$need_singbox" = 1 ]; then
+    log "FAILED: sing-box did not start within ${TIMEOUT}s."
+else
+    log "FAILED: web UI did not come up within ${TIMEOUT}s."
+fi
 if [ "$UPGRADE" = 1 ]; then
     log "upgrade failed -- auto-rolling back..."
     do_rollback

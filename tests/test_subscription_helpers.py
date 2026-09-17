@@ -58,5 +58,10 @@ def main():
     print("subscription helper checks: PASS")
 
 
+# pytest entry point: the file predates pytest -- expose the suite as a test.
+def test_subscription_helpers():
+    main()
+
+
 if __name__ == "__main__":
     main()

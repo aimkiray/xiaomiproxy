@@ -20,6 +20,34 @@ local uci       = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config"
 local CFG = "homeproxy"
 local UCINODE = "node"
 
+-- Serialize UCI writes against update_subscriptions.lua (same lock dir):
+-- two processes staging+committing the same package could interleave
+-- /tmp/.uci delta writes.  Manual import is quick; wait briefly, then fail
+-- loudly rather than racing or blocking a subscription run for ages.
+local lock_dir = hp.RUN_DIR .. "/uci-write.lock.d"
+local lock_held = false
+hp.mkdir_p(hp.RUN_DIR)
+for _ = 1, 10 do
+	if os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0 then
+		lock_held = true
+		break
+	end
+	os.execute("sleep 1")
+end
+if not lock_held then
+	io.write(hp.encode_json({ ok = false, error = "another update is in progress",
+		added = {}, skipped = {} }) .. "\n")
+	io.flush()
+	os.exit(3)
+end
+
+local function release_lock()
+	if lock_held then
+		os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+		lock_held = false
+	end
+end
+
 uci:load(CFG)
 
 -- Reuse the subscription feature cache when present (written by
@@ -57,6 +85,7 @@ else
 end
 
 local added, skipped = {}, {}
+local ok_run, run_err = pcall(function()
 for line in input:gmatch("[^\r\n]+") do
 	line = hp.trim(line)
 	if line ~= "" then
@@ -101,12 +130,17 @@ if #added > 0 then
 	-- Checked commit (same convention as update_subscriptions' commit_uci):
 	-- a full/read-only filesystem must surface as an error, not a fake
 	-- success listing nodes that were never persisted.
-	if not uci:commit(CFG) then
-		io.write(hp.encode_json({ ok = false, error = "uci commit failed",
-			added = {}, skipped = skipped }) .. "\n")
-		io.flush()
-		os.exit(1)
-	end
+	if not uci:commit(CFG) then error("uci commit failed") end
+end
+end)
+release_lock()
+
+if not ok_run then
+	io.write(hp.encode_json({ ok = false, error = tostring(run_err),
+		added = {}, skipped = skipped }) .. "\n")
+	io.flush()
+	os.exit(1)
 end
 
 io.write(hp.encode_json({ ok = true, added = added, skipped = skipped }) .. "\n")
+io.flush()

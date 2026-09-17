@@ -5,6 +5,7 @@ on:
     branches:
       - 'master'
       - 'dev'
+      - 'xiaomi'
     paths:
       - 'root/**'
       - 'Makefile'
@@ -15,6 +16,7 @@ on:
     branches:
       - 'master'
       - 'dev'
+      - 'xiaomi'
     types:
       - opened
       - synchronize

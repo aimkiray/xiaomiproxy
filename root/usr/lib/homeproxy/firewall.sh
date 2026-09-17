@@ -106,6 +106,10 @@ ALL_IPSETS="homeproxy_cn4 homeproxy_cn6 homeproxy_gfw4 homeproxy_gfw6 homeproxy_
 # Remove every PREROUTING/OUTPUT jump we might have added (per LAN iface, plus
 # the iface-agnostic OUTPUT and lo re-entry jumps), then flush+delete chains
 # and destroy ipsets. Best-effort; missing rules/chains are ignored.
+# $1 = "keep_ipsets" (fw3 reload path): the sets are rebuilt right after and
+# dnsmasq still answers from its cache without re-adding learned entries, so
+# destroying wan_proxy/wan_direct/gfw sets would drop dynamic domain steering
+# until every name re-resolves.  Full start/stop destroys them as before.
 stop_fw() {
 	for ip in $IP4 $IP6; do
 		# Remove every jump into our chains from the built-in chains, whatever
@@ -131,7 +135,9 @@ stop_fw() {
 		$ip -F homeproxy_in 2>/dev/null;  $ip -X homeproxy_in 2>/dev/null
 		$ip -F homeproxy_fwd 2>/dev/null; $ip -X homeproxy_fwd 2>/dev/null
 	done
-	for _s in $ALL_IPSETS; do ipset destroy "$_s" 2>/dev/null; done
+	[ "${1:-}" = "keep_ipsets" ] || {
+		for _s in $ALL_IPSETS; do ipset destroy "$_s" 2>/dev/null; done
+	}
 }
 
 # --- filter-table accepts (mirror upstream firewall_pre.uc) -------------
@@ -175,8 +181,12 @@ cmd=${1:-}
 # interfaces that were renamed/removed would otherwise keep steering the
 # old iface into the rebuilt chains forever (hook_prerouting only -D's the
 # CURRENT LAN_IFS).
-case "$cmd" in start|restart) stop_fw ;;
-*) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
+# "reload" is what the fw3 include runs on firewall reloads: identical to
+# start except the ipsets (and their dnsmasq-learned members) survive.
+case "$cmd" in
+	start|restart) stop_fw ;;
+	reload)        stop_fw keep_ipsets ;;
+	*) echo "usage: $0 {start|stop|restart|reload}" >&2; exit 2 ;;
 esac
 
 # Validate routing_mode (M18): unknown value silently proxies everything.
@@ -348,9 +358,10 @@ emit_routing() {
 
 # destination ipset match -> target. $1=ip $2=table $3=chain $4=kind(wan_proxy|wan_direct) $5=target
 emit_dst_ipset() {
-	local ip="$1" tbl="$2" ch="$3" kind="$4" tgt="$5" set4 set6
+	local ip="$1" tbl="$2" ch="$3" kind="$4" tgt="$5" set4="" set6=""
 	if [ "$kind" = "wan_proxy" ]; then set4=homeproxy_wan_proxy4; set6=homeproxy_wan_proxy6
-	elif [ "$kind" = "wan_direct" ]; then set4=homeproxy_wan_direct4; set6=homeproxy_wan_direct6; fi
+	elif [ "$kind" = "wan_direct" ]; then set4=homeproxy_wan_direct4; set6=homeproxy_wan_direct6
+	else return 0; fi
 	# Family-correct: an inet6 set can never match under iptables (and vice
 	# versa) -- emitting both leaves dead rules and spurious set references.
 	if [ "$ip" = "$IP6" ]; then

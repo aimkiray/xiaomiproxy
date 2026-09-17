@@ -25,35 +25,44 @@ local function push(t, v) t[#t + 1] = v end
 local function log(msg) hp.log(msg, "SUBSCRIBE") end
 
 -- Concurrency lock: prevent cron + manual update from clobbering each other.
--- Uses a timestamp-based stale lock: if the lock file is younger than
--- MAX_LOCK_AGE seconds, another update is likely still running.  Lua 5.1
--- has no getpid(), so a PID-based lock is unreliable (subshell PIDs die
--- immediately).  The timestamp approach is simple and sufficient for the
--- cron-vs-manual use case (updates take < 60s).
-local lock_path = hp.RUN_DIR .. "/subscribe.lock"
+-- mkdir() is the only atomic check-and-create primitive available here --
+-- the old timestamp file could be written simultaneously by two updaters
+-- (check passes for both, both write, both proceed).  Stale detection uses
+-- the directory's mtime: locks older than MAX_LOCK_AGE are presumed dead
+-- (SIGKILL, power loss) and reclaimed.  RUN_DIR is tmpfs so a stale lock
+-- can never survive a reboot.
+-- Shared with add_nodes.lua: serializes all writers to the homeproxy UCI
+-- package, not just subscription updates.
+local lock_dir = hp.RUN_DIR .. "/uci-write.lock.d"
 local MAX_LOCK_AGE = 120  -- seconds
--- RUN_DIR must exist before the lock file can be created (mkdir was
--- previously done later, silently disabling the lock on first run).
 hp.mkdir_p(hp.RUN_DIR)
-do
-  local lock_time = tonumber(hp.trim(hp.readfile(lock_path) or ""))
-  if lock_time then
-    local age = os.time() - lock_time
-    if age >= 0 and age < MAX_LOCK_AGE then
-      log("Another subscription update is running (started " .. age .. "s ago), aborting.")
-      -- Nonzero: a skipped update is NOT a success -- callers (web/CLI) must
-      -- not treat it as "nodes refreshed" (e.g. by restarting the service).
-      os.exit(3)
-    end
-  end
-  -- Write current timestamp as the lock.
-  local wf = io.open(lock_path, "w")
-  if wf then
-    wf:write(tostring(os.time()))
-    wf:close()
-  else
-    log("WARNING: could not create lock file, proceeding without concurrency protection.")
-  end
+local function acquire_lock()
+	if os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0 then
+		return true
+	end
+	local h = io.popen("stat -c %Y " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+	local mt = h and tonumber(hp.trim(h:read("*a") or "")) or nil
+	if h then h:close() end
+	if mt == nil then
+		-- Cannot age it; assume a live updater owns it.
+		return false
+	end
+	local age = os.time() - mt
+	if age >= 0 and age < MAX_LOCK_AGE then
+		log("Another subscription update is running (started " .. age .. "s ago), aborting.")
+		return false
+	end
+	-- Stale (or timestamp in the future after a clock step): reclaim once.
+	os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+	return os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0
+end
+local function release_lock()
+	os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+end
+if not acquire_lock() then
+	-- Nonzero: a skipped update is NOT a success -- callers (web/CLI) must
+	-- not treat it as "nodes refreshed" (e.g. by restarting the service).
+	os.exit(3)
 end
 
 local allow_insecure    = uci:get(CFG, UCISUB, "allow_insecure") or "0"
@@ -357,7 +366,9 @@ local function main()
 			log("Starting service...")
 			os.execute("/etc/init.d/homeproxy start >/dev/null 2>&1")
 		end
-		return
+		-- Failure must reach the caller: previously this returned normally
+		-- so the web API reported a successful update after every fetch died.
+		return false
 	end
 
 	-- remove stale nodes + update existing.
@@ -514,16 +525,20 @@ local function main()
 	log(string.format("%s nodes added, %s removed. Successfully updated subscriptions.", added, removed))
 end
 
-local ok, err = pcall(main)
--- Always clean up the concurrency lock.
-os.remove(lock_path)
+local ok, res = pcall(main)
+-- Always release the concurrency lock.
+release_lock()
 if not ok then
-	log("[FATAL ERROR] " .. tostring(err))
+	log("[FATAL ERROR] " .. tostring(res))
 	if via_proxy ~= "1" then
 		os.execute("/etc/init.d/homeproxy stop >/dev/null 2>&1")
 		os.execute("/etc/init.d/homeproxy start >/dev/null 2>&1")
 	else
 		os.execute("/etc/init.d/homeproxy restart >/dev/null 2>&1")
 	end
+	os.exit(1)
+end
+if res == false then
+	-- main() already logged the reason and recovered the service.
 	os.exit(1)
 end

@@ -89,9 +89,21 @@ end
 function _M.strToTime(str)
     if _M.isEmpty(str) then return nil end
     local s = tostring(str)
-    -- Already has a valid sing-box duration suffix?  Match patterns like
-    -- "300s", "30m", "1h", "2d", "500ms" (and optional fractional part).
-    if s:match("^%d+ms$") or s:match("^%d+%.?%d*[smhd]$") then return s end
+    -- Already has a valid sing-box duration suffix?  Go-style durations can
+    -- be composite ("1h30m", "5m3ms").  Lua patterns cannot repeat a capture,
+    -- so consume "<num><unit>" pieces from the front; "ms" must be tried
+    -- first so its trailing "s" is not taken as a seconds unit.
+    local rest = s
+    while rest ~= "" do
+        local n = rest:gsub("^%d+%.?%d*ms", "", 1):gsub("^%d+%.?%d*[smhd]", "", 1)
+        if n == rest then break end
+        rest = n
+    end
+    if rest == "" then return s end
+    -- Bare value must be a (possibly fractional) number of seconds; appending
+    -- "s" to anything else would produce an invalid duration that only fails
+    -- deep inside sing-box check.
+    if not s:match("^%d+%.?%d*$") then return nil end
     return s .. "s"
 end
 
@@ -128,10 +140,19 @@ local function is_ip6(s)
     if s:find("[^0-9a-fA-F:.]") then return false end
     if s:sub(1, 1) == ":" and s:sub(2, 2) ~= ":" then return false end
     if s:sub(-1, -1) == ":" and s:sub(-2, -2) ~= ":" then return false end
-    local groups = 0
-    local seen_double = s:find("::", 1, true) ~= nil
+    if s:find(":::", 1, true) then return false end
     local _, doubles = s:gsub("::", "")
-    if doubles > 1 or s:find(":::", 1, true) then return false end
+    if doubles > 1 then return false end
+    local seen_double = doubles > 0
+    local groups = 0
+    -- IPv4-embedded tail ("::ffff:192.0.2.1"): a dotted-quad is only valid
+    -- as the last group and counts as two 16-bit groups.
+    if s:find(".", 1, true) then
+        local v4 = s:match(":(%d+%.%d+%.%d+%.%d+)$")
+        if not v4 or not is_ip4(v4) then return false end
+        s = s:sub(1, #s - #v4 - 1)
+        groups = 2
+    end
     for part in s:gmatch("[^:]+") do
         if #part > 4 then return false end
         groups = groups + 1
@@ -283,7 +304,16 @@ function _M.parseURL(url)
     -- authority
     url = url:gsub("^//([^/]*)", function(v)
         v = v:gsub("^([^@]+)@", function(u) o.userinfo = u; return "" end)
-        v = v:gsub(":(%d+)$", function(p) o.port = p; return "" end)
+        v = v:gsub(":(%d+)$", function(p)
+            -- Strip a numeric port only when the remainder cannot itself be
+            -- an IPv6 literal: "https://2001:db8::1/" must not lose ":1".
+            local rest = v:sub(1, #v - #p - 1)
+            if rest:find("[", 1, true) or not rest:find(":", 1, true) then
+                o.port = p
+                return ""
+            end
+            return ":" .. p
+        end)
         local bare = v:gsub("[%[%]]", "")
         if _M.validation("ip4addr", v) or _M.validation("hostname", v) then
             o.hostname = v
@@ -316,7 +346,30 @@ end
 -- JSON: luci.json drops nil keys; we additionally drop "" / empty containers
 -- to match the upstream removeBlankAttrs behaviour.
 -- ---------------------------------------------------------------------------
-local json = require("luci.json")
+-- luci.json (luci-lib-json, pure Lua: encode/decode) is preferred; fall back
+-- to luci.jsonc (luci-lib-jsonc C binding: parse/stringify) which the ipk
+-- declares as the dependency.
+local json
+do
+	local ok, mod = pcall(require, "luci.json")
+	if not ok or type(mod) ~= "table" then
+		local ok2, jc = pcall(require, "luci.jsonc")
+		if ok2 and type(jc) == "table" then
+			json = {
+				encode = function(t) return jc.stringify(t) end,
+				decode = function(s)
+					local v = jc.parse(s)
+					return v
+				end,
+			}
+		end
+	else
+		json = mod
+	end
+end
+if not json then
+	error("no JSON module available (need luci.json or luci.jsonc)")
+end
 
 local function clean(res)
     local t = type(res)

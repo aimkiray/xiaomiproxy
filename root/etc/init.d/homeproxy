@@ -25,6 +25,17 @@ log() {
 }
 
 start_service() {
+    # RUN_DIR must exist before anything can write the log file.
+    mkdir -p "$RUN_DIR"
+
+    # Migration must run BEFORE config_load: config_get reads a snapshot
+    # captured by config_load, so migrating afterwards would leave this run
+    # using pre-migration values (e.g. an ipv6_support default the migrator
+    # just rewrote) while the generators see the migrated ones.
+    if ! lua "$HP_LUA_DIR/migrate_config.lua" 2>>"$LOG_PATH"; then
+        log "Warning: config migration failed (continuing with current config)."
+    fi
+
     config_load "$CONF"
 
     local routing_mode proxy_mode lan_proxy_mode
@@ -44,13 +55,6 @@ start_service() {
 
     if [ "$outbound_node" = "nil" ] && [ "$server_enabled" = "0" ]; then
         return 1
-    fi
-
-    mkdir -p "$RUN_DIR"
-
-    # one-shot migration / defaults (check exit status — M4)
-    if ! lua "$HP_LUA_DIR/migrate_config.lua" 2>>"$LOG_PATH"; then
-        log "Warning: config migration failed (continuing with current config)."
     fi
 
     if [ "$outbound_node" != "nil" ]; then
@@ -132,17 +136,21 @@ start_service() {
             fi
         fi
         if echo "$proxy_mode" | grep -q tun; then
-            local tun_name tun_mark
+            local tun_name tun_mark tun_table
             config_get tun_name "infra" "tun_name" "singtun0"
             config_get tun_mark "infra" "tun_mark" "102"
+            # TUN-marked traffic needs a default route via the tun device;
+            # tproxy-marked traffic needs a local/lo route. They must not
+            # share a table: a single table can only hold one of the two.
+            config_get tun_table "infra" "tun_table" "102"
             ip tuntap add mode tun user root name "$tun_name" 2>/dev/null
             sleep 1
             ip link set "$tun_name" up 2>/dev/null
-            ip route replace default dev "$tun_name" table "$table_mark" 2>/dev/null
-            ip rule add fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null
+            ip route replace default dev "$tun_name" table "$tun_table" 2>/dev/null
+            ip rule add fwmark "$tun_mark" lookup "$tun_table" 2>/dev/null
             [ "$ipv6_support" = "1" ] && {
-                ip -6 route replace default dev "$tun_name" table "$table_mark" 2>/dev/null
-                ip -6 rule add fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null
+                ip -6 route replace default dev "$tun_name" table "$tun_table" 2>/dev/null
+                ip -6 rule add fwmark "$tun_mark" lookup "$tun_table" 2>/dev/null
             }
         fi
 
@@ -286,9 +294,10 @@ stop_service() {
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
 
-    local table_mark
+    local table_mark tun_table
     config_load "$CONF"
     config_get table_mark "infra" "table_mark" "100"
+    config_get tun_table "infra" "tun_table" "102"
     local tproxy_mark tun_mark
     config_get tproxy_mark "infra" "tproxy_mark" "101"
     config_get tun_mark "infra" "tun_mark" "102"
@@ -297,14 +306,20 @@ stop_service() {
     ip route del local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
     while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
     ip -6 route del local ::/0 dev lo table "$table_mark" 2>/dev/null
-    while ip rule del fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null; do :; done
-    while ip -6 rule del fwmark "$tun_mark" lookup "$table_mark" 2>/dev/null; do :; done
+    # tun rules live in tun_table now; also drain table_mark to clean up
+    # rules written by versions that shared one table for both marks.
+    for _t in "$tun_table" "$table_mark"; do
+        while ip rule del fwmark "$tun_mark" lookup "$_t" 2>/dev/null; do :; done
+        while ip -6 rule del fwmark "$tun_mark" lookup "$_t" 2>/dev/null; do :; done
+    done
 
     # Tear down the tun device (H10: was only in service_stopped, which is not
     # called from reload_service's stop).
     local tun_name
     config_get tun_name "infra" "tun_name" "singtun0"
+    ip route del default dev "$tun_name" table "$tun_table" 2>/dev/null
     ip route del default dev "$tun_name" table "$table_mark" 2>/dev/null
+    ip -6 route del default dev "$tun_name" table "$tun_table" 2>/dev/null
     ip -6 route del default dev "$tun_name" table "$table_mark" 2>/dev/null
     ip link set "$tun_name" down 2>/dev/null
     ip tuntap del mode tun name "$tun_name" 2>/dev/null
