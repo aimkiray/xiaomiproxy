@@ -223,8 +223,14 @@ build_ipset() {
 	if [ -n "$file" ] && [ -f "$file" ]; then
 		awk -v n="$tmp" 'NF && !/^#/ {print "add "n" "$0}' "$file" 2>/dev/null | ipset restore -exist 2>/dev/null
 	fi
-	ipset create "$name" hash:net family "$fam" maxelem 65536 -exist 2>/dev/null \
-		|| { ipset destroy "$tmp" 2>/dev/null; return 1; }
+	if ! ipset create "$name" hash:net family "$fam" maxelem 65536 -exist 2>/dev/null; then
+		# -exist only succeeds for a same-type set: a stale set with a
+		# different type/family must be replaced outright (rules were already
+		# torn down by stop_fw, so destroy cannot hit EBUSY here).
+		ipset destroy "$name" 2>/dev/null
+		ipset create "$name" hash:net family "$fam" maxelem 65536 2>/dev/null \
+			|| { ipset destroy "$tmp" 2>/dev/null; return 1; }
+	fi
 	ipset swap "$tmp" "$name" 2>/dev/null \
 		|| { ipset destroy "$tmp" 2>/dev/null; return 1; }
 	ipset destroy "$tmp" 2>/dev/null
@@ -233,7 +239,12 @@ build_ipset() {
 # re-apply instead of wiping what dnsmasq already learned.
 build_ipset_empty() {
 	local name="$1" fam="$2" type="${3:-hash:net}"
-	ipset create "$name" "$type" family "$fam" maxelem 65536 -exist 2>/dev/null || return 1
+	ipset create "$name" "$type" family "$fam" maxelem 65536 -exist 2>/dev/null && return 0
+	# A same-named set of a different type/family makes -exist fail: replace
+	# it. Dynamic members are unusable under the wrong type anyway, and
+	# missing the referenced rules entirely is worse than re-learning them.
+	ipset destroy "$name" 2>/dev/null
+	ipset create "$name" "$type" family "$fam" maxelem 65536 2>/dev/null || return 1
 }
 load_list_ipset() {
 	# $1=ipset-name $2=family $3=space-separated-cidr-list

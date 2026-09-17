@@ -526,6 +526,12 @@ local function main()
 end
 
 local ok, res = pcall(main)
+if not ok then
+	-- Drop staged uci deltas: /tmp/.uci persists across processes, so the
+	-- next `uci commit homeproxy` by an unrelated caller would otherwise
+	-- flush our half-written node set.
+	pcall(function() uci:revert(CFG) end)
+end
 -- Always release the concurrency lock.
 release_lock()
 if not ok then

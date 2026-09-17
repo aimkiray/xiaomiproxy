@@ -58,7 +58,9 @@ uci:load(CFG)
 local function detect_features()
 	local raw = hp.readfile(hp.RUN_DIR .. "/singbox-features.json")
 	if raw then
-		local data = hp.decode_json(raw)
+		-- luci.jsonc's parse() raises on bad JSON (luci.json's decode returns
+		-- nil) -- pcall keeps a corrupt cache from killing the whole import.
+		local _, data = pcall(hp.decode_json, raw)
 		local f = data and data.features
 		if type(f) == "table"
 			and type(f.with_quic) == "boolean"
@@ -133,6 +135,13 @@ if #added > 0 then
 	if not uci:commit(CFG) then error("uci commit failed") end
 end
 end)
+
+if not ok_run then
+	-- Drop the staged delta: uncommitted uci changes live in /tmp/.uci and
+	-- the NEXT `uci commit homeproxy` by any process would flush this
+	-- half-applied import along with its own change.
+	pcall(function() uci:revert(CFG) end)
+end
 release_lock()
 
 if not ok_run then
